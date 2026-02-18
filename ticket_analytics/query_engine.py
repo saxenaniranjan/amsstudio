@@ -13,7 +13,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.graph_objs import Figure
 
-from .constants import CHART_KEYWORDS, PRIORITY_MAP, RESOLVED_STATUSES, SLA_THRESHOLD_HOURS
+from .constants import CHART_KEYWORDS, OPEN_STATUSES, PRIORITY_MAP, RESOLVED_STATUSES, SLA_THRESHOLD_HOURS
 from .insights import build_insight_report
 from .preprocessing import parse_duration_to_hours
 
@@ -39,6 +39,7 @@ class AgenticQueryIntent:
     lookback_unit: str | None
     top_n: int | None
     source: str
+    series_dimension: str | None = None
 
 
 @dataclass
@@ -90,10 +91,70 @@ _LOOKBACK_UNITS = {
     "years": "Y",
 }
 
+_NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
+
 
 def _normalize_text(text: str) -> str:
     cleaned = re.sub(r"[^a-z0-9]+", " ", text.lower())
     return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _dedupe_keep_order(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        token = value.strip()
+        if not token:
+            continue
+        marker = token.lower()
+        if marker in seen:
+            continue
+        seen.add(marker)
+        out.append(token)
+    return out
+
+
+def _matching_values_by_terms(series: pd.Series, terms: list[str]) -> list[str]:
+    normalized_terms = [_normalize_text(term) for term in terms if _normalize_text(term)]
+    if not normalized_terms:
+        return []
+    matches: list[str] = []
+    for value in _value_candidates(series, max_values=400):
+        token = _normalize_text(value)
+        if not token:
+            continue
+        if any(term in token for term in normalized_terms):
+            matches.append(value)
+    return _dedupe_keep_order(matches)
+
+
+def _contains_time_axis_phrase(query: str) -> bool:
+    q = query.lower()
+    phrase_patterns = [
+        r"\bover(?:\s+all)?\s+time\b",
+        r"\bacross\s+time\b",
+        r"\ball\s+time\b",
+        r"\btime\s+series\b",
+        r"\btimeline\b",
+        r"\bdaywise\b",
+        r"\bweekwise\b",
+        r"\bmonthwise\b",
+        r"\btrend\b",
+    ]
+    return any(re.search(pattern, q) is not None for pattern in phrase_patterns)
 
 
 def _extract_json_blob(text: str) -> Optional[dict[str, Any]]:
@@ -132,17 +193,28 @@ def _detect_chart_type(query: str) -> str:
 
 def _detect_metric(query: str) -> str:
     q = query.lower()
-    if any(k in q for k in ["sla compliance", "compliance %", "sla adherence", "adherence %"]):
+    if any(
+        k in q
+        for k in [
+            "sla compliance",
+            "compliance %",
+            "sla adherence",
+            "adherence %",
+            "within sla",
+            "sla met",
+            "met sla",
+        ]
+    ):
         return "sla_compliance_pct"
-    if any(k in q for k in ["mttr", "mean time to resolve", "resolution time"]):
+    if any(k in q for k in ["mttr", "mean time to resolve", "resolution time", "mean resolution time", "turnaround time"]):
         return "avg_mttr_hours"
-    if any(k in q for k in ["breach rate", "sla breach rate"]):
+    if any(k in q for k in ["breach rate", "sla breach rate", "sla breach %", "breach %"]):
         return "breach_rate_pct"
-    if any(k in q for k in ["breached", "sla violations", "sla breach count"]):
+    if any(k in q for k in ["breached", "sla violations", "sla breach count", "breach count", "sla breach trend"]):
         return "breached_tickets"
-    if any(k in q for k in ["open ticket", "backlog"]):
+    if any(k in q for k in ["open ticket", "open tickets", "backlog", "unresolved", "pending tickets", "aging tickets"]):
         return "open_tickets"
-    if any(k in q for k in ["team performance", "performance index"]):
+    if any(k in q for k in ["team performance", "performance index", "underperforming teams", "team efficiency"]):
         return "team_performance_index"
     return "ticket_count"
 
@@ -205,11 +277,24 @@ def _detect_dimension(query: str, df: pd.DataFrame) -> str | None:
         (r"\b(by cluster|per cluster|cluster wise|by tower|tower wise|workstream wise)\b", "cluster"),
     ]
 
-    for pattern, column in explicit_patterns:
-        if re.search(pattern, q) and column in df.columns:
-            return column
+    matches: list[tuple[int, str]] = []
+    if "service" in df.columns:
+        service_match = re.search(r"\b(application|applications|app|apps)\b", q)
+        if service_match:
+            matches.append((service_match.start(), "service"))
 
-    if any(k in q for k in ["over time", "trend", "timeline", "time series", "daywise", "weekwise", "monthwise"]):
+    for pattern, column in explicit_patterns:
+        if column not in df.columns:
+            continue
+        match = re.search(pattern, q)
+        if match:
+            matches.append((match.start(), column))
+
+    if matches:
+        matches.sort(key=lambda item: item[0])
+        return matches[0][1]
+
+    if _contains_time_axis_phrase(q):
         if "created_at" in df.columns:
             return "created_at"
 
@@ -224,17 +309,102 @@ def _detect_dimension(query: str, df: pd.DataFrame) -> str | None:
     return None
 
 
-def _extract_top_n(query: str) -> int | None:
-    match = re.search(r"\btop\s+(\d+)\b", query.lower())
-    if not match:
+def _detect_series_dimension(query: str, df: pd.DataFrame, primary_dimension: str | None) -> str | None:
+    q = query.lower()
+    if not primary_dimension:
         return None
-    return max(1, int(match.group(1)))
+
+    if "priority" in df.columns and primary_dimension != "priority":
+        priority_patterns = [
+            r"\bacross all priorit(?:y|ies)\b",
+            r"\bsplit by priority\b",
+            r"\bpriority(?:\s|-)?wise\b",
+            r"\bpriority labelled\b",
+            r"\bpriority breakdown\b",
+            r"\bcolor by priority\b",
+            r"\bcolour by priority\b",
+            r"\bdifferent colou?rs?\b",
+            r"\bstacked\b",
+        ]
+        priority_values = re.findall(r"\bp\s*([1-4])\b", q)
+        unique_priority_values = sorted(set(priority_values))
+        has_priority_values = len(unique_priority_values) > 0
+        comparative_phrase = re.search(r"\b(across|for|between|vs|versus|by)\b", q) is not None
+        if (
+            any(re.search(pattern, q) for pattern in priority_patterns)
+            or (has_priority_values and "priority" in q)
+            or (len(unique_priority_values) >= 2 and comparative_phrase)
+        ):
+            return "priority"
+
+    if "status" in df.columns and primary_dimension != "status":
+        status_patterns = [
+            r"\bsplit by status\b",
+            r"\bstatus(?:\s|-)?wise\b",
+            r"\bstatus breakdown\b",
+            r"\bcolor by status\b",
+            r"\bcolour by status\b",
+        ]
+        if any(re.search(pattern, q) for pattern in status_patterns):
+            return "status"
+
+    if "team" in df.columns and primary_dimension != "team":
+        team_patterns = [
+            r"\bsplit by team\b",
+            r"\bteam(?:\s|-)?wise\b",
+            r"\bassignment group(?:\s|-)?wise\b",
+            r"\bcolor by team\b",
+            r"\bcolour by team\b",
+        ]
+        if any(re.search(pattern, q) for pattern in team_patterns):
+            return "team"
+
+    return None
+
+
+def _extract_top_n(query: str) -> int | None:
+    q = query.lower()
+
+    def _to_int(token: str) -> int | None:
+        token = token.strip().lower()
+        if not token:
+            return None
+        if token.isdigit():
+            return int(token)
+        return _NUMBER_WORDS.get(token)
+
+    patterns = [
+        r"\btop\s+([a-z0-9]+)\b",
+        r"\b(?:highest|largest|biggest|worst)\s+([a-z0-9]+)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, q)
+        if not match:
+            continue
+        parsed = _to_int(match.group(1))
+        if parsed is not None:
+            return max(1, parsed)
+
+    return None
 
 
 def _extract_lookback(query: str) -> tuple[int | None, str | None]:
-    match = re.search(r"(?:last|past)\s+(\d+)\s+(day|days|week|weeks|month|months|quarter|quarters|year|years)", query.lower())
+    q = query.lower()
+
+    if re.search(r"\b(mtd|month to date)\b", q):
+        return 1, "month"
+    if re.search(r"\b(qtd|quarter to date)\b", q):
+        return 1, "quarter"
+    if re.search(r"\b(ytd|year to date)\b", q):
+        return 1, "year"
+
+    current = re.search(r"\b(this|current)\s+(day|week|month|quarter|year)\b", q)
+    if current:
+        return 1, current.group(2)
+
+    match = re.search(r"(?:last|past)\s+(\d+)\s+(day|days|week|weeks|month|months|quarter|quarters|year|years)", q)
     if not match:
-        singular = re.search(r"\b(?:last|past)\s+(day|week|month|quarter|year)\b", query.lower())
+        singular = re.search(r"\b(?:last|past)\s+(day|week|month|quarter|year)\b", q)
         if singular:
             return 1, singular.group(1)
         return None, None
@@ -247,20 +417,42 @@ def _value_candidates(series: pd.Series, max_values: int = 40) -> list[str]:
     return values[:max_values]
 
 
+def _add_filter_values(filters: dict[str, list[str]], column: str, values: list[str]) -> None:
+    merged = filters.get(column, []) + values
+    filters[column] = _dedupe_keep_order(merged)
+
+
 def _extract_filters(query: str, df: pd.DataFrame) -> dict[str, list[str]]:
     qnorm = f" {_normalize_text(query)} "
+    qlower = query.lower()
     filters: dict[str, list[str]] = {}
 
-    priority_match = re.findall(r"\b(p[1-4])\b", query.lower())
+    priority_match = re.findall(r"\bp\s*([1-4])\b", qlower)
     if priority_match and "priority" in df.columns:
-        filters["priority"] = sorted({x.upper() for x in priority_match})
+        _add_filter_values(filters, "priority", [f"P{value}" for value in priority_match])
+
+    if "priority" in df.columns:
+        descriptor_map = {
+            "critical": "P1",
+            "high": "P2",
+            "medium": "P3",
+            "moderate": "P3",
+            "low": "P4",
+            "minor": "P4",
+        }
+        semantic_priorities = [mapped for marker, mapped in descriptor_map.items() if re.search(rf"\b{marker}\b", qlower)]
+        if semantic_priorities:
+            _add_filter_values(filters, "priority", semantic_priorities)
+
+        explicit_priority_level = re.findall(r"\b(?:sev(?:erity)?|priority)\s*[-_: ]*([1-4])\b", qlower)
+        if explicit_priority_level:
+            _add_filter_values(filters, "priority", [f"P{level}" for level in explicit_priority_level])
 
     explicit_patterns: list[tuple[str, str]] = [
-        (r"(?:for|in|by)\s+team\s+([a-z0-9 _\\-]+)", "team"),
-        (r"(?:for|in|by)\s+application\s+([a-z0-9 _\\-]+)", "service"),
+        (r"(?:for|in|by)\s+(?:team|assignment group)\s+([a-z0-9 _\\-]+)", "team"),
+        (r"(?:for|in|by)\s+(?:application|business service|service(?!\s+desk))\s+([a-z0-9 _\\-]+)", "service"),
         (r"(?:for|in|by)\s+priority\s+([a-z0-9 _\\-]+)", "priority"),
     ]
-    qlower = query.lower()
     for pattern, column in explicit_patterns:
         if column not in df.columns:
             continue
@@ -268,6 +460,11 @@ def _extract_filters(query: str, df: pd.DataFrame) -> dict[str, list[str]]:
         if not match:
             continue
         captured = match.group(1).strip().replace(" tickets only", "").replace(" only", "")
+        captured = re.split(
+            r"\b(?:over|across|with|where|who|that|during|from|between|last|past|this|current)\b",
+            captured,
+            maxsplit=1,
+        )[0]
         captured = re.sub(r"\s+", " ", captured)
         if not captured:
             continue
@@ -293,8 +490,65 @@ def _extract_filters(query: str, df: pd.DataFrame) -> dict[str, list[str]]:
             if not parsed_values:
                 parsed_values = [captured]
 
-        merged = filters.get(column, []) + parsed_values
-        filters[column] = sorted({value for value in merged}, key=lambda value: value.lower())
+        _add_filter_values(filters, column, parsed_values)
+
+    if "ticket_type" in df.columns:
+        type_keywords: list[tuple[list[str], list[str]]] = [
+            (["incident", "inc"], [r"\bincident(?:s)?\b", r"\bincident ticket(?:s)?\b"]),
+            (["service request", "sr"], [r"\bservice request(?:s)?\b", r"\bservice req(?:uest)?(?:s)?\b", r"\bsr\b"]),
+            (["change request", "change", "crq"], [r"\bchange request(?:s)?\b", r"\bchange ticket(?:s)?\b", r"\bcrq\b"]),
+            (["problem", "prb"], [r"\bproblem(?:s)?\b", r"\bproblem ticket(?:s)?\b", r"\bprb\b"]),
+        ]
+        semantic_type_terms: list[str] = []
+        for terms, patterns in type_keywords:
+            if any(re.search(pattern, qlower) for pattern in patterns):
+                semantic_type_terms.extend(terms)
+        if semantic_type_terms:
+            ticket_type_matches = _matching_values_by_terms(df["ticket_type"], semantic_type_terms)
+            if ticket_type_matches:
+                _add_filter_values(filters, "ticket_type", ticket_type_matches)
+
+    open_signals = [
+        r"\bopen\b",
+        r"\bunresolved\b",
+        r"\bbacklog\b",
+        r"\bon hold\b",
+        r"\bin progress\b",
+        r"\bpending\b",
+        r"\breopened\b",
+        r"\bactive\b",
+    ]
+    resolved_signals = [
+        r"\bresolved\b",
+        r"\bclosed\b",
+        r"\bcompleted\b",
+        r"\bfulfilled\b",
+    ]
+    has_open_signal = any(re.search(pattern, qlower) for pattern in open_signals)
+    has_resolved_signal = any(re.search(pattern, qlower) for pattern in resolved_signals)
+    if has_open_signal and not has_resolved_signal and "is_open" in df.columns:
+        _add_filter_values(filters, "is_open", ["True"])
+    if has_resolved_signal and not has_open_signal and "is_resolved" in df.columns:
+        _add_filter_values(filters, "is_resolved", ["True"])
+
+    if "status" in df.columns:
+        status_terms: list[str] = []
+        if re.search(r"\bon hold\b", qlower):
+            status_terms.extend(["on hold", "hold"])
+        if re.search(r"\bin progress\b", qlower):
+            status_terms.extend(["in progress", "in_progress"])
+        if re.search(r"\bpending\b", qlower):
+            status_terms.append("pending")
+        if re.search(r"\breopened\b", qlower):
+            status_terms.append("reopened")
+        if has_open_signal and not has_resolved_signal:
+            status_terms.extend([*OPEN_STATUSES, "open"])
+        if has_resolved_signal and not has_open_signal:
+            status_terms.extend([*RESOLVED_STATUSES, "resolved", "closed"])
+        if status_terms:
+            status_matches = _matching_values_by_terms(df["status"], status_terms)
+            if status_matches:
+                _add_filter_values(filters, "status", status_matches)
 
     candidate_columns = [
         "team",
@@ -319,8 +573,7 @@ def _extract_filters(query: str, df: pd.DataFrame) -> dict[str, list[str]]:
             if f" {token} " in qnorm:
                 matches.append(value)
         if matches:
-            merged = filters.get(column, []) + matches
-            filters[column] = sorted({value for value in merged}, key=lambda value: value.lower())
+            _add_filter_values(filters, column, matches)
 
     return filters
 
@@ -350,15 +603,13 @@ def _detect_request_kind(query: str) -> str:
         return "text_recommendations"
     if any(k in lowered for k in ["graph", "chart", "plot", "visualize", "trend", "timeline"]):
         return "graph"
+    if _contains_time_axis_phrase(lowered):
+        return "graph"
     return "table"
 
 
 def _has_trend_phrase(query: str) -> bool:
-    q = query.lower()
-    return any(
-        phrase in q
-        for phrase in ["over time", "trend", "timeline", "time series", "daywise", "weekwise", "monthwise"]
-    )
+    return _contains_time_axis_phrase(query)
 
 
 def _has_explicit_chart_type(query: str) -> bool:
@@ -429,9 +680,11 @@ class IntentAgent:
         rule_filters = _extract_filters(query, self.df)
         rule_metric = _detect_metric(query)
         rule_dimension = _detect_dimension(query, self.df)
+        rule_series_dimension = _detect_series_dimension(query, self.df, rule_dimension or intent.dimension)
         rule_chart_type = _detect_chart_type(query)
         rule_request_kind = _detect_request_kind(query)
         rule_top_n = _extract_top_n(query)
+        explicit_chart_type = _has_explicit_chart_type(query)
 
         if rule_request_kind == "graph":
             intent.request_kind = "graph"
@@ -454,17 +707,30 @@ class IntentAgent:
         elif intent.dimension is None:
             intent.dimension = rule_dimension
 
+        if intent.request_kind == "graph" and _has_trend_phrase(query) and "created_at" in self.df.columns:
+            if rule_dimension and rule_dimension != "created_at" and intent.series_dimension is None:
+                intent.series_dimension = rule_dimension
+            intent.dimension = "created_at"
+
         if intent.request_kind == "graph":
-            if rule_chart_type != "bar":
+            if explicit_chart_type:
+                intent.chart_type = rule_chart_type
+            elif rule_chart_type != "bar":
                 intent.chart_type = rule_chart_type
             # Top-N category requests generally expect category comparison, not timeline.
             if intent.top_n and not _has_trend_phrase(query):
                 intent.chart_type = "bar"
-            if intent.dimension == "created_at" and intent.chart_type == "bar":
+            if intent.dimension == "created_at" and intent.chart_type == "bar" and not explicit_chart_type:
                 intent.chart_type = "line"
 
         if intent.top_n is None and rule_top_n is not None:
             intent.top_n = rule_top_n
+
+        if intent.series_dimension is None and rule_series_dimension is not None:
+            intent.series_dimension = rule_series_dimension
+
+        if intent.series_dimension == intent.dimension:
+            intent.series_dimension = None
 
         intent.time_grain = _infer_time_grain(query, intent.lookback_unit, intent.lookback_value)
         return intent
@@ -493,6 +759,7 @@ class IntentAgent:
                 "chart_type": "bar | line | scatter | pie | histogram | heatmap",
                 "metric": "ticket_count | avg_mttr_hours | sla_compliance_pct | breach_rate_pct | breached_tickets | open_tickets | team_performance_index",
                 "dimension": "existing column name or null",
+                "series_dimension": "existing column name for color/stack split or null",
                 "time_grain": "D | W | M | Q | Y",
                 "filters": "dict of {column:[values]}",
                 "lookback": "{value:int|null, unit:day|week|month|quarter|year|null}",
@@ -559,6 +826,11 @@ class IntentAgent:
                 lookback_unit=lookback_unit if lookback_unit in _LOOKBACK_UNITS else None,
                 top_n=top_n,
                 source="llm_intent_agent",
+                series_dimension=(
+                    str(parsed.get("series_dimension"))
+                    if parsed.get("series_dimension") in self.df.columns and parsed.get("series_dimension") != dimension
+                    else None
+                ),
             )
 
             if intent.dimension is None:
@@ -573,12 +845,19 @@ class IntentAgent:
         chart_type = _detect_chart_type(query)
         metric = _detect_metric(query)
         dimension = _detect_dimension(query, self.df)
+        series_dimension = _detect_series_dimension(query, self.df, dimension)
         time_grain = _infer_time_grain(query, lookback_unit, lookback_value)
         filters = _extract_filters(query, self.df)
         top_n = _extract_top_n(query)
+        explicit_chart_type = _has_explicit_chart_type(query)
+
+        if request_kind == "graph" and _has_trend_phrase(query) and "created_at" in self.df.columns:
+            if dimension and dimension != "created_at" and series_dimension is None:
+                series_dimension = dimension
+            dimension = "created_at"
 
         # If query is time-based and no explicit chart type is requested, prefer line.
-        if request_kind == "graph" and dimension == "created_at" and chart_type == "bar":
+        if request_kind == "graph" and dimension == "created_at" and chart_type == "bar" and not explicit_chart_type:
             chart_type = "line"
 
         return AgenticQueryIntent(
@@ -592,6 +871,7 @@ class IntentAgent:
             lookback_unit=lookback_unit,
             top_n=top_n,
             source="rule_intent_agent",
+            series_dimension=series_dimension if series_dimension != dimension else None,
         )
 
 
@@ -780,7 +1060,13 @@ class GraphAgent:
         )
 
     def _series_breakdown_column(self, df: pd.DataFrame, intent: AgenticQueryIntent) -> str | None:
-        if intent.request_kind != "graph" or intent.dimension != "created_at":
+        if intent.request_kind != "graph":
+            return None
+
+        if intent.series_dimension and intent.series_dimension in df.columns and intent.series_dimension != intent.dimension:
+            return intent.series_dimension
+
+        if intent.dimension != "created_at":
             return None
 
         candidates = [col for col, values in intent.filters.items() if len(values) > 1 and col in df.columns]
@@ -1019,9 +1305,30 @@ class GraphAgent:
                 sort_cols.append(series_col)
             result = result.sort_values(sort_cols)
         else:
-            result = result.sort_values(out_col, ascending=False)
             if intent.top_n:
-                result = result.head(intent.top_n)
+                if series_col and series_col in result.columns:
+                    primary_rank = (
+                        result.groupby(group_col, dropna=False)[out_col]
+                        .mean()
+                        .sort_values(ascending=False)
+                        .head(intent.top_n)
+                        .reset_index()
+                    )
+                    top_values = set(primary_rank[group_col].tolist())
+                    result = result[result[group_col].isin(top_values)]
+                    result = result.merge(
+                        primary_rank.rename(columns={out_col: "_rank_value"}),
+                        on=group_col,
+                        how="left",
+                    )
+                    sort_cols = ["_rank_value", group_col]
+                    if series_col in result.columns:
+                        sort_cols.append(series_col)
+                    result = result.sort_values(sort_cols, ascending=[False, True, True]).drop(columns=["_rank_value"])
+                else:
+                    result = result.sort_values(out_col, ascending=False).head(intent.top_n)
+            else:
+                result = result.sort_values(out_col, ascending=False)
 
         return result
 
@@ -1045,7 +1352,10 @@ class GraphAgent:
             return px.histogram(data, x=x_col, y=y_col if y_col in data.columns else None, color=color, title=title)
         if chart_type == "heatmap":
             return px.density_heatmap(data, x=x_col, y=y_col, title=title)
-        return px.bar(data, x=x_col, y=y_col, color=color, title=title)
+        fig = px.bar(data, x=x_col, y=y_col, color=color, title=title)
+        if color is not None:
+            fig.update_layout(barmode="stack")
+        return fig
 
 
 class ValidatorAgent:
@@ -1194,6 +1504,10 @@ def _repair_intent_if_possible(intent: AgenticQueryIntent, output: BuildOutput, 
 
     if intent.metric == "avg_mttr_hours" and "mttr_hours" not in df.columns and "resolution_time_hours" in df.columns:
         repaired.metric = "ticket_count"
+        changed = True
+
+    if repaired.series_dimension == repaired.dimension:
+        repaired.series_dimension = None
         changed = True
 
     if changed:

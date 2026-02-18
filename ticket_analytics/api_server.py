@@ -40,7 +40,13 @@ SESSION_STORE: dict[str, SessionData] = {}
 
 
 def _cache_dir() -> Path:
-    path = Path(os.getenv("TICKETX_SESSION_CACHE_DIR", ".session_cache"))
+    configured = os.getenv("TICKETX_SESSION_CACHE_DIR")
+    if configured:
+        path = Path(configured)
+    elif os.getenv("VERCEL"):
+        path = Path("/tmp/ticketx_session_cache")
+    else:
+        path = Path(".session_cache")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -50,20 +56,27 @@ def _session_paths(session_id: str) -> tuple[Path, Path]:
     return base / f"{session_id}.meta.json", base / f"{session_id}.df.pkl"
 
 
-def _persist_session(session: SessionData) -> None:
-    meta_path, df_path = _session_paths(session.session_id)
-    metadata = {
-        "session_id": session.session_id,
-        "workspace_name": session.workspace_name,
-        "created_at": session.created_at,
-        "upload_history": session.upload_history,
-    }
-    meta_path.write_text(json.dumps(metadata), encoding="utf-8")
-    session.enriched_df.to_pickle(df_path)
+def _persist_session(session: SessionData) -> str | None:
+    try:
+        meta_path, df_path = _session_paths(session.session_id)
+        metadata = {
+            "session_id": session.session_id,
+            "workspace_name": session.workspace_name,
+            "created_at": session.created_at,
+            "upload_history": session.upload_history,
+        }
+        meta_path.write_text(json.dumps(metadata), encoding="utf-8")
+        session.enriched_df.to_pickle(df_path)
+        return None
+    except Exception as exc:  # pragma: no cover - environment dependent
+        return f"Session cache persistence unavailable: {exc}"
 
 
 def _load_session_from_disk(session_id: str) -> SessionData | None:
-    meta_path, df_path = _session_paths(session_id)
+    try:
+        meta_path, df_path = _session_paths(session_id)
+    except Exception:
+        return None
     if not meta_path.exists() or not df_path.exists():
         return None
     try:
@@ -340,7 +353,7 @@ def create_app() -> FastAPI:
             enriched_df=enriched,
             upload_history=upload_history,
         )
-        _persist_session(SESSION_STORE[session_id])
+        session_warning = _persist_session(SESSION_STORE[session_id])
 
         payload = {
             "session_id": session_id,
@@ -349,6 +362,7 @@ def create_app() -> FastAPI:
             "columns": list(enriched.columns),
             "upload_history": upload_history,
             "file_errors": file_errors,
+            "session_warning": session_warning,
             "overview": _overview_payload(enriched),
         }
         return JSONResponse(content=payload)

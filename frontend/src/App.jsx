@@ -1297,12 +1297,14 @@ function ChatBotPage() {
       setGraphs({});
       setShowDashboard(true);
       const fileErrors = response.file_errors || [];
-      if (fileErrors.length) {
+      const sessionWarning = response.session_warning;
+      if (fileErrors.length || sessionWarning) {
         const warning = fileErrors
           .slice(0, 2)
           .map((item) => `${item.file_name}: ${item.error}`)
           .join(" | ");
-        setStatus(`Workspace processed with warnings: ${warning}`);
+        const warnings = [warning, sessionWarning].filter(Boolean).join(" | ");
+        setStatus(`Workspace processed with warnings: ${warnings}`);
       } else {
         setStatus("Workspace processed successfully. Dashboard is ready.");
       }

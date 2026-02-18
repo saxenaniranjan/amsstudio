@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from io import BytesIO
 
 from fastapi.testclient import TestClient
@@ -202,3 +203,47 @@ def test_session_restores_from_disk_after_memory_reset(raw_ticket_df, tmp_path, 
     )
     assert overview_response.status_code == 200
     assert session_id in api_server_module.SESSION_STORE
+
+
+def test_cache_dir_defaults_to_tmp_on_vercel(monkeypatch) -> None:
+    monkeypatch.delenv("TICKETX_SESSION_CACHE_DIR", raising=False)
+    monkeypatch.setenv("VERCEL", "1")
+
+    cache_path = api_server_module._cache_dir()
+    assert cache_path == Path("/tmp/ticketx_session_cache")
+    assert cache_path.exists()
+
+
+def test_api_process_succeeds_when_persist_session_fails(raw_ticket_df, monkeypatch) -> None:
+    client = TestClient(app)
+    excel_bytes = _to_excel_bytes(raw_ticket_df)
+
+    monkeypatch.setattr(
+        api_server_module,
+        "_persist_session",
+        lambda _session: "Session cache persistence unavailable: read-only filesystem",
+    )
+
+    response = client.post(
+        "/api/sessions/process",
+        data={
+            "workspace_name": "Warning Workspace",
+            "user_mapping": json.dumps({}),
+            "sla_threshold_hours": json.dumps({"P1": 4, "P2": 8, "P3": 24, "P4": 72}),
+        },
+        files=[
+            (
+                "files",
+                (
+                    "tickets.xlsx",
+                    excel_bytes,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ),
+            )
+        ],
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload.get("session_warning")
+    assert "persistence unavailable" in payload["session_warning"].lower()

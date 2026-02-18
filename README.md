@@ -1,0 +1,58 @@
+# ITIL Ticket Analytics Platform
+
+A complete analytics platform for ITIL ticket dumps (Excel/CSV) with:
+- robust preprocessing for messy exports,
+- derived analyst-grade columns (Category, Business Function, MTTR, SLA Risk, Team Performance),
+- natural-language query interface for insights and charts,
+- unified graphing through **Plotly** (single chart library),
+- automated test suite.
+
+## What It Does
+
+1. Ingests ticket dumps from common ITIL tools.
+2. Normalizes columns and auto-maps aliases (`Incident ID`, `Assignment Group`, etc.).
+3. Derives missing business columns:
+   - `category_derived`
+   - `business_function_derived`
+   - `mttr_hours`
+   - `ticket_age_hours`
+   - `resolution_bucket`
+   - `sla_threshold_hours`
+   - `is_sla_breached`
+   - `sla_risk`
+   - `team_performance_index`
+   - `team_performance_band`
+4. Produces analyst-style outputs:
+   - KPI summary,
+   - anomaly detection in daily ticket volume,
+   - actionable recommendations.
+5. Supports free-form queries like:
+   - "show bar chart of ticket count by team"
+   - "top 5 categories by breach rate"
+   - "recommend actions to reduce MTTR"
+
+## Run Locally
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .[dev]
+streamlit run app.py
+```
+
+## Run Tests
+
+```bash
+pytest
+```
+
+## Project Structure
+
+- `app.py`: Streamlit UI
+- `ticket_analytics/preprocessing.py`: ingestion and normalization
+- `ticket_analytics/features.py`: derived feature logic
+- `ticket_analytics/insights.py`: KPI, anomaly, recommendation engine
+- `ticket_analytics/query_engine.py`: NL query parsing and slicing
+- `ticket_analytics/visualization.py`: Plotly chart generation (single library)
+- `ticket_analytics/pipeline.py`: orchestration session/pipeline API
+- `tests/`: end-to-end and unit tests

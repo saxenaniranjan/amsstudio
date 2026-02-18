@@ -13,7 +13,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.graph_objs import Figure
 
-from .constants import CHART_KEYWORDS, OPEN_STATUSES, PRIORITY_MAP, RESOLVED_STATUSES, SLA_THRESHOLD_HOURS
+from .constants import CHART_KEYWORDS, COLUMN_ALIASES, OPEN_STATUSES, PRIORITY_MAP, RESOLVED_STATUSES, SLA_THRESHOLD_HOURS
 from .insights import build_insight_report
 from .preprocessing import parse_duration_to_hours
 
@@ -40,6 +40,9 @@ class AgenticQueryIntent:
     top_n: int | None
     source: str
     series_dimension: str | None = None
+    value_column: str | None = None
+    value_agg: str | None = None
+    dimension_explicit: bool = False
 
 
 @dataclass
@@ -110,6 +113,200 @@ _NUMBER_WORDS = {
 def _normalize_text(text: str) -> str:
     cleaned = re.sub(r"[^a-z0-9]+", " ", text.lower())
     return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _best_available_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for column in candidates:
+        if column in df.columns:
+            return column
+    return None
+
+
+def _column_phrase_map(df: pd.DataFrame) -> dict[str, list[str]]:
+    phrase_map: dict[str, list[str]] = {}
+
+    for column in df.columns:
+        phrases = [column, column.replace("_", " ")]
+        if column.endswith("_derived"):
+            phrases.append(column.replace("_derived", "").replace("_", " "))
+        phrase_map[column] = phrases
+
+    for canonical, aliases in COLUMN_ALIASES.items():
+        if canonical in df.columns:
+            cleaned_aliases = list(aliases)
+            if canonical in {"sub_domain", "domain"} and "business_function_derived" in df.columns:
+                cleaned_aliases = [
+                    alias
+                    for alias in cleaned_aliases
+                    if _normalize_text(alias) not in {"business function", "business functions", "business_function"}
+                ]
+            phrase_map.setdefault(canonical, []).extend(cleaned_aliases)
+
+    semantic_aliases: list[tuple[list[str], list[str]]] = [
+        (["team"], ["assignment group", "assignment groups", "resolver group", "support group", "team", "teams"]),
+        (
+            ["service"],
+            [
+                "application",
+                "applications",
+                "app",
+                "apps",
+                "business service",
+                "service",
+                "services",
+            ],
+        ),
+        (
+            ["business_function_derived", "sub_domain", "domain"],
+            [
+                "business function",
+                "business functions",
+                "function",
+                "functions",
+                "sub domain",
+                "sub-domain",
+            ],
+        ),
+        (
+            ["root_cause", "issue_signature", "category_derived", "category", "subcategory"],
+            [
+                "root cause",
+                "root causes",
+                "rca",
+                "issue pattern",
+                "issue signature",
+                "problem type",
+                "problem category",
+            ],
+        ),
+        (["created_at"], ["time", "timeline", "over time", "date", "created date", "opened date"]),
+    ]
+    for candidate_columns, aliases in semantic_aliases:
+        resolved = _best_available_column(df, candidate_columns)
+        if resolved:
+            phrase_map.setdefault(resolved, []).extend(aliases)
+
+    normalized_map: dict[str, list[str]] = {}
+    for column, phrases in phrase_map.items():
+        deduped = _dedupe_keep_order([_normalize_text(phrase) for phrase in phrases if str(phrase).strip()])
+        normalized_map[column] = [phrase for phrase in deduped if phrase]
+
+    return normalized_map
+
+
+def _resolve_column_by_name(candidate: str, df: pd.DataFrame) -> str | None:
+    if not candidate:
+        return None
+
+    trimmed = str(candidate).strip()
+    if not trimmed:
+        return None
+
+    by_lower = {str(col).lower(): str(col) for col in df.columns}
+    direct = by_lower.get(trimmed.lower())
+    if direct:
+        return direct
+
+    normalized = _normalize_text(trimmed)
+    if not normalized:
+        return None
+
+    phrase_map = _column_phrase_map(df)
+    for column, aliases in phrase_map.items():
+        if normalized in aliases:
+            return column
+    return None
+
+
+def _extract_referenced_columns(query: str, df: pd.DataFrame) -> list[str]:
+    qnorm = f" {_normalize_text(query)} "
+    if not qnorm.strip():
+        return []
+
+    matches: list[tuple[int, int, str]] = []
+    phrase_map = _column_phrase_map(df)
+
+    for column, phrases in phrase_map.items():
+        for phrase in phrases:
+            token = phrase.strip()
+            if len(token) < 2:
+                continue
+            marker = f" {token} "
+            idx = qnorm.find(marker)
+            if idx != -1:
+                matches.append((idx, -len(token), column))
+
+    for quote_pattern in [r"`([^`]+)`", r"\"([^\"]+)\"", r"'([^']+)'"]:
+        for match in re.finditer(quote_pattern, query):
+            resolved = _resolve_column_by_name(match.group(1), df)
+            if resolved:
+                matches.append((match.start(), -len(match.group(1)), resolved))
+
+    if not matches:
+        return []
+
+    matches.sort(key=lambda item: (item[0], item[1]))
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for _, _, column in matches:
+        if column in seen:
+            continue
+        seen.add(column)
+        ordered.append(column)
+    return ordered
+
+
+def _is_metric_like_column(column: str) -> bool:
+    return column in {
+        "resolution_time",
+        "mttr_hours",
+        "resolution_time_hours",
+        "ticket_age_hours",
+        "ticket_age_days",
+        "team_performance_index",
+        "sla_threshold_hours",
+        "is_sla_breached",
+        "is_open",
+        "is_resolved",
+    }
+
+
+def _detect_custom_value_column(
+    query: str,
+    df: pd.DataFrame,
+    metric: str,
+    dimension: str | None,
+    series_dimension: str | None,
+) -> str | None:
+    if metric != "ticket_count":
+        return None
+
+    referenced = _extract_referenced_columns(query, df)
+    for column in referenced:
+        if column in {dimension, series_dimension}:
+            continue
+        if column not in df.columns:
+            continue
+        series = df[column]
+        if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
+            return column
+    return None
+
+
+def _has_dimension_signal(query: str, df: pd.DataFrame) -> bool:
+    q = query.lower()
+    if _contains_time_axis_phrase(q):
+        return True
+    lookback_value, _ = _extract_lookback(query)
+    if lookback_value is not None:
+        return True
+    if re.search(r"\b(?:by|across|versus|vs|against|over)\b", q):
+        referenced = _extract_referenced_columns(query, df)
+        if any(not _is_metric_like_column(column) for column in referenced):
+            return True
+    if _has_explicit_dimension_phrase(query):
+        return True
+    return False
 
 
 def _dedupe_keep_order(values: list[str]) -> list[str]:
@@ -294,6 +491,18 @@ def _detect_dimension(query: str, df: pd.DataFrame) -> str | None:
         matches.sort(key=lambda item: item[0])
         return matches[0][1]
 
+    across_match = re.search(r"\b(?:by|across|versus|vs|against)\s+([a-z0-9_ \-]+)", q)
+    if across_match:
+        raw = across_match.group(1).strip()
+        raw = re.split(
+            r"\b(?:over|with|where|who|that|during|from|between|last|past|this|current|for)\b",
+            raw,
+            maxsplit=1,
+        )[0].strip()
+        resolved = _resolve_column_by_name(raw, df)
+        if resolved:
+            return resolved
+
     if _contains_time_axis_phrase(q):
         if "created_at" in df.columns:
             return "created_at"
@@ -301,6 +510,14 @@ def _detect_dimension(query: str, df: pd.DataFrame) -> str | None:
     if lookback_phrase:
         if "created_at" in df.columns:
             return "created_at"
+
+    referenced_columns = _extract_referenced_columns(query, df)
+    for column in referenced_columns:
+        if column == "created_at" and not (_contains_time_axis_phrase(q) or lookback_phrase):
+            continue
+        if _is_metric_like_column(column):
+            continue
+        return column
 
     for candidate in ["team", "service", "priority", "category_derived"]:
         if candidate in df.columns:
@@ -358,6 +575,22 @@ def _detect_series_dimension(query: str, df: pd.DataFrame, primary_dimension: st
         ]
         if any(re.search(pattern, q) for pattern in team_patterns):
             return "team"
+
+    referenced_columns = _extract_referenced_columns(query, df)
+    for column in referenced_columns:
+        if column == primary_dimension:
+            continue
+        if primary_dimension == "business_function_derived" and column in {"sub_domain", "domain"}:
+            continue
+        if primary_dimension in {"sub_domain", "domain"} and column == "business_function_derived":
+            continue
+        if column not in df.columns:
+            continue
+        if _is_metric_like_column(column):
+            continue
+        if pd.api.types.is_datetime64_any_dtype(df[column]):
+            continue
+        return column
 
     return None
 
@@ -732,6 +965,18 @@ class IntentAgent:
         if intent.series_dimension == intent.dimension:
             intent.series_dimension = None
 
+        if intent.value_column is None or intent.value_column not in self.df.columns:
+            intent.value_column = _detect_custom_value_column(
+                query,
+                self.df,
+                intent.metric,
+                intent.dimension,
+                intent.series_dimension,
+            )
+            if intent.value_column and intent.value_agg is None:
+                intent.value_agg = "mean"
+
+        intent.dimension_explicit = _has_dimension_signal(query, self.df)
         intent.time_grain = _infer_time_grain(query, intent.lookback_unit, intent.lookback_value)
         return intent
 
@@ -760,6 +1005,8 @@ class IntentAgent:
                 "metric": "ticket_count | avg_mttr_hours | sla_compliance_pct | breach_rate_pct | breached_tickets | open_tickets | team_performance_index",
                 "dimension": "existing column name or null",
                 "series_dimension": "existing column name for color/stack split or null",
+                "value_column": "existing numeric column name for y-axis aggregation, or null",
+                "value_agg": "mean | sum | min | max | median | null",
                 "time_grain": "D | W | M | Q | Y",
                 "filters": "dict of {column:[values]}",
                 "lookback": "{value:int|null, unit:day|week|month|quarter|year|null}",
@@ -831,6 +1078,17 @@ class IntentAgent:
                     if parsed.get("series_dimension") in self.df.columns and parsed.get("series_dimension") != dimension
                     else None
                 ),
+                value_column=(
+                    str(parsed.get("value_column"))
+                    if parsed.get("value_column") in self.df.columns
+                    and pd.api.types.is_numeric_dtype(self.df[str(parsed.get("value_column"))])
+                    else None
+                ),
+                value_agg=(
+                    str(parsed.get("value_agg")).lower()
+                    if str(parsed.get("value_agg")).lower() in {"mean", "sum", "min", "max", "median"}
+                    else None
+                ),
             )
 
             if intent.dimension is None:
@@ -860,6 +1118,8 @@ class IntentAgent:
         if request_kind == "graph" and dimension == "created_at" and chart_type == "bar" and not explicit_chart_type:
             chart_type = "line"
 
+        value_column = _detect_custom_value_column(query, self.df, metric, dimension, series_dimension)
+
         return AgenticQueryIntent(
             request_kind=request_kind,
             chart_type=chart_type,
@@ -872,6 +1132,9 @@ class IntentAgent:
             top_n=top_n,
             source="rule_intent_agent",
             series_dimension=series_dimension if series_dimension != dimension else None,
+            value_column=value_column,
+            value_agg="mean" if value_column else None,
+            dimension_explicit=_has_dimension_signal(query, self.df),
         )
 
 
@@ -883,6 +1146,7 @@ class GraphAgent:
 
     def build(self, intent: AgenticQueryIntent) -> BuildOutput:
         working = self._augment_dataframe(self.original_df)
+        metric_label = self._metric_label(intent)
 
         missing_requirements = [col for col in _METRIC_REQUIREMENTS[intent.metric] if col not in working.columns]
         if missing_requirements:
@@ -891,7 +1155,7 @@ class GraphAgent:
                 + ", ".join(missing_requirements)
             )
             if intent.request_kind == "graph":
-                title = f"{_METRIC_LABELS[intent.metric]} ({intent.chart_type})"
+                title = f"{metric_label} ({intent.chart_type})"
                 return self._build_no_data_output(
                     intent=intent,
                     text=no_data_text,
@@ -924,7 +1188,7 @@ class GraphAgent:
         if filtered.empty:
             no_data_text = "No data available for the requested graph after applying filters and date range."
             if intent.request_kind == "graph":
-                title = f"{_METRIC_LABELS[intent.metric]} ({intent.chart_type})"
+                title = f"{metric_label} ({intent.chart_type})"
                 return self._build_no_data_output(
                     intent=intent,
                     text=no_data_text,
@@ -956,7 +1220,7 @@ class GraphAgent:
         if grouped.empty:
             no_data_text = "No data available for the requested graph because the aggregated result is empty."
             if intent.request_kind == "graph":
-                title = f"{_METRIC_LABELS[intent.metric]} ({intent.chart_type})"
+                title = f"{metric_label} ({intent.chart_type})"
                 return self._build_no_data_output(
                     intent=intent,
                     text=no_data_text,
@@ -983,11 +1247,11 @@ class GraphAgent:
                 data_unavailable=True,
             )
 
-        metric_col = self._metric_output_column(intent.metric)
+        metric_col = self._metric_output_column(intent.metric, intent.value_column, intent.value_agg)
         x_col = "period" if intent.dimension == "created_at" else (intent.dimension or grouped.columns[0])
         color_col = series_col if series_col and series_col in grouped.columns else None
 
-        chart_title = f"{_METRIC_LABELS[intent.metric]} by {x_col}"
+        chart_title = f"{metric_label} by {x_col}"
         if color_col:
             chart_title = f"{chart_title} and {color_col}"
         figure = None
@@ -996,13 +1260,13 @@ class GraphAgent:
             figure = self._build_figure(grouped, intent.chart_type, x_col, metric_col, chart_title, color_col=color_col)
             kind = "chart"
             text = (
-                f"Generated {intent.chart_type} chart for {_METRIC_LABELS[intent.metric]} with {len(grouped)} data points. "
+                f"Generated {intent.chart_type} chart for {metric_label} with {len(grouped)} data points. "
                 f"Rows analyzed: {len(filtered)}."
             )
         else:
             kind = "table"
             text = (
-                f"Computed {_METRIC_LABELS[intent.metric]} grouped by {x_col}. "
+                f"Computed {metric_label} grouped by {x_col}. "
                 f"Rows analyzed: {len(filtered)}."
             )
 
@@ -1194,7 +1458,12 @@ class GraphAgent:
         sliced = dated[dated["created_at"] >= start]
         return sliced, {"start": start.isoformat(), "end": end.isoformat()}
 
-    def _metric_output_column(self, metric: str) -> str:
+    def _metric_output_column(self, metric: str, value_column: str | None = None, value_agg: str | None = None) -> str:
+        if value_column:
+            agg = (value_agg or "mean").lower()
+            if agg == "median":
+                agg = "median"
+            return f"{agg}_{value_column}"
         return {
             "ticket_count": "ticket_count",
             "avg_mttr_hours": "avg_mttr_hours",
@@ -1204,6 +1473,12 @@ class GraphAgent:
             "open_tickets": "open_tickets",
             "team_performance_index": "team_performance_index",
         }.get(metric, "ticket_count")
+
+    def _metric_label(self, intent: AgenticQueryIntent) -> str:
+        if intent.value_column:
+            agg = (intent.value_agg or "mean").upper()
+            return f"{agg} {intent.value_column.replace('_', ' ')}"
+        return _METRIC_LABELS[intent.metric]
 
     def _aggregate(self, df: pd.DataFrame, intent: AgenticQueryIntent, series_col: str | None = None) -> pd.DataFrame:
         if df.empty:
@@ -1225,10 +1500,27 @@ class GraphAgent:
             group_cols.append(series_col)
 
         metric = intent.metric
-        out_col = self._metric_output_column(metric)
+        out_col = self._metric_output_column(metric, intent.value_column, intent.value_agg)
+        custom_value_column = intent.value_column if intent.value_column in work.columns else None
+        custom_agg = (intent.value_agg or "mean").lower()
+        if custom_agg not in {"mean", "sum", "min", "max", "median"}:
+            custom_agg = "mean"
 
         if group_col is None:
-            if metric == "ticket_count":
+            if custom_value_column:
+                numeric_series = pd.to_numeric(work[custom_value_column], errors="coerce")
+                if custom_agg == "sum":
+                    value = float(numeric_series.sum())
+                elif custom_agg == "min":
+                    value = float(numeric_series.min())
+                elif custom_agg == "max":
+                    value = float(numeric_series.max())
+                elif custom_agg == "median":
+                    value = float(numeric_series.median())
+                else:
+                    value = float(numeric_series.mean())
+                result = pd.DataFrame([{out_col: value}])
+            elif metric == "ticket_count":
                 result = pd.DataFrame([{out_col: int(len(work))}])
             elif metric == "avg_mttr_hours":
                 result = pd.DataFrame([{out_col: float(pd.to_numeric(work["mttr_hours"], errors="coerce").mean())}])
@@ -1249,7 +1541,22 @@ class GraphAgent:
         if group_col not in work.columns:
             return pd.DataFrame()
 
-        if metric == "ticket_count":
+        if custom_value_column:
+            numeric = pd.to_numeric(work[custom_value_column], errors="coerce")
+            work = work.assign(_custom_metric=numeric).dropna(subset=["_custom_metric"])
+            if work.empty:
+                return pd.DataFrame()
+            if custom_agg == "sum":
+                result = work.groupby(group_cols, dropna=False)["_custom_metric"].sum().rename(out_col).reset_index()
+            elif custom_agg == "min":
+                result = work.groupby(group_cols, dropna=False)["_custom_metric"].min().rename(out_col).reset_index()
+            elif custom_agg == "max":
+                result = work.groupby(group_cols, dropna=False)["_custom_metric"].max().rename(out_col).reset_index()
+            elif custom_agg == "median":
+                result = work.groupby(group_cols, dropna=False)["_custom_metric"].median().rename(out_col).reset_index()
+            else:
+                result = work.groupby(group_cols, dropna=False)["_custom_metric"].mean().rename(out_col).reset_index()
+        elif metric == "ticket_count":
             result = work.groupby(group_cols, dropna=False).size().rename(out_col).reset_index()
         elif metric == "avg_mttr_hours":
             result = (
@@ -1452,7 +1759,7 @@ def _clarification_prompt(query: str, intent: AgenticQueryIntent) -> str | None:
     if intent.dimension is None:
         return (
             "I need one clarification before generating the graph: which dimension should I use "
-            "(for example team, priority, service, category, or time)?"
+            "(for example team, priority, service, category, business function, root cause, or time)?"
         )
 
     if intent.metric == "ticket_count" and any(
@@ -1464,14 +1771,14 @@ def _clarification_prompt(query: str, intent: AgenticQueryIntent) -> str | None:
         )
 
     if (
-        not _has_explicit_dimension_phrase(query)
+        not intent.dimension_explicit
         and not _has_trend_phrase(query)
         and not intent.lookback_value
         and not intent.top_n
     ):
         return (
             "I need one clarification before generating the graph: which dimension should I use "
-            "(for example team, priority, service, category, or time)?"
+            "(for example team, priority, service, category, business function, root cause, or time)?"
         )
 
     if intent.dimension == "created_at" and intent.top_n and not _has_trend_phrase(query):
@@ -1508,6 +1815,11 @@ def _repair_intent_if_possible(intent: AgenticQueryIntent, output: BuildOutput, 
 
     if repaired.series_dimension == repaired.dimension:
         repaired.series_dimension = None
+        changed = True
+
+    if repaired.value_column and repaired.value_column not in df.columns:
+        repaired.value_column = None
+        repaired.value_agg = None
         changed = True
 
     if changed:

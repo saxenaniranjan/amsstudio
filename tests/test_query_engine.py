@@ -291,3 +291,56 @@ def test_clarification_when_graph_request_lacks_dimension(raw_ticket_df, referen
     assert result.kind == "clarification"
     assert "clarification" in result.text.lower()
     assert result.chart is None
+
+
+def test_mttr_across_business_functions_is_handled_without_clarification(raw_ticket_df, reference_time) -> None:
+    enriched = run_ticket_pipeline(raw_ticket_df, reference_time=reference_time)
+    result = answer_query("draw a line chart of mttr across business functions", enriched)
+
+    assert result.kind == "chart"
+    assert result.chart is not None
+    assert result.chart["chart_type"] == "line"
+    assert result.data is not None
+    assert not result.data.empty
+
+    trace = result.agent_trace or {}
+    intent = trace.get("intent", {})
+    assert intent.get("metric") == "avg_mttr_hours"
+    assert intent.get("dimension") in {"business_function_derived", "sub_domain", "domain"}
+
+
+def test_two_categorical_columns_query_builds_stacked_count_chart(raw_ticket_df, reference_time) -> None:
+    enriched = run_ticket_pipeline(raw_ticket_df, reference_time=reference_time)
+    result = answer_query("create a bar chart of root cause by business function", enriched)
+
+    assert result.kind == "chart"
+    assert result.chart is not None
+    assert result.chart["chart_type"] == "bar"
+    assert result.data is not None
+    assert "ticket_count" in result.data.columns
+
+    trace = result.agent_trace or {}
+    intent = trace.get("intent", {})
+    dimension = intent.get("dimension")
+    series_dimension = intent.get("series_dimension")
+
+    assert dimension in {"business_function_derived", "sub_domain", "domain"}
+    assert series_dimension in {"issue_signature", "category_derived", "category", "subcategory", "root_cause"}
+    assert dimension in result.data.columns
+    assert series_dimension in result.data.columns
+
+
+def test_any_numeric_column_can_be_aggregated_by_dimension(raw_ticket_df, reference_time) -> None:
+    enriched = run_ticket_pipeline(raw_ticket_df, reference_time=reference_time)
+    result = answer_query("create a bar chart of ticket_age_days by business function", enriched)
+
+    assert result.kind == "chart"
+    assert result.chart is not None
+    assert result.data is not None
+    assert not result.data.empty
+
+    trace = result.agent_trace or {}
+    intent = trace.get("intent", {})
+    assert intent.get("value_column") == "ticket_age_days"
+    assert intent.get("value_agg") == "mean"
+    assert "mean_ticket_age_days" in result.data.columns

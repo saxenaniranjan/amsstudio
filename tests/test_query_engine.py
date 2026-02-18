@@ -55,8 +55,14 @@ def test_agentic_query_returns_data_unavailable_message(raw_ticket_df, reference
     enriched = run_ticket_pipeline(raw_ticket_df, reference_time=reference_time)
     result = answer_query("show mttr line chart over last 3 months for team UnknownTeamX", enriched)
 
-    assert result.kind == "text"
+    assert result.kind == "chart"
+    assert result.chart is not None
+    assert result.chart["type"] == "plotly_figure"
+    assert result.chart["chart_type"] == "line"
     assert "No data available" in result.text
+    assert result.chart["figure"] is not None
+    trace = result.agent_trace or {}
+    assert trace.get("validation", {}).get("is_valid") is True
 
 
 def test_agentic_mttr_last_month_priority_filters_generate_line_time_graph(raw_ticket_df, reference_time) -> None:

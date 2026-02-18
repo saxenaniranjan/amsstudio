@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 from plotly.graph_objs import Figure
 
 from .constants import CHART_KEYWORDS, PRIORITY_MAP, RESOLVED_STATUSES, SLA_THRESHOLD_HOURS
@@ -557,12 +558,26 @@ class GraphAgent:
 
         missing_requirements = [col for col in _METRIC_REQUIREMENTS[intent.metric] if col not in working.columns]
         if missing_requirements:
+            no_data_text = (
+                "Requested graph cannot be generated because required data is unavailable: "
+                + ", ".join(missing_requirements)
+            )
+            if intent.request_kind == "graph":
+                title = f"{_METRIC_LABELS[intent.metric]} ({intent.chart_type})"
+                return self._build_no_data_output(
+                    intent=intent,
+                    text=no_data_text,
+                    title=title,
+                    reason="Missing required metric columns",
+                    filtered_rows=0,
+                    total_rows=int(len(working)),
+                    applied_filters=intent.filters,
+                    date_window={"start": None, "end": None},
+                    missing_requirements=missing_requirements,
+                )
             return BuildOutput(
                 kind="text",
-                text=(
-                    "Requested graph cannot be generated because required data is unavailable: "
-                    + ", ".join(missing_requirements)
-                ),
+                text=no_data_text,
                 data=None,
                 figure=None,
                 chart_type=None,
@@ -579,9 +594,23 @@ class GraphAgent:
         filtered, date_window = self._apply_lookback(filtered, intent)
 
         if filtered.empty:
+            no_data_text = "No data available for the requested graph after applying filters and date range."
+            if intent.request_kind == "graph":
+                title = f"{_METRIC_LABELS[intent.metric]} ({intent.chart_type})"
+                return self._build_no_data_output(
+                    intent=intent,
+                    text=no_data_text,
+                    title=title,
+                    reason="No rows matched the current filters/date range",
+                    filtered_rows=0,
+                    total_rows=int(len(working)),
+                    applied_filters=applied_filters,
+                    date_window=date_window,
+                    missing_requirements=[],
+                )
             return BuildOutput(
                 kind="text",
-                text="No data available for the requested graph after applying filters and date range.",
+                text=no_data_text,
                 data=None,
                 figure=None,
                 chart_type=None,
@@ -597,9 +626,23 @@ class GraphAgent:
         series_col = self._series_breakdown_column(filtered, intent)
         grouped = self._aggregate(filtered, intent, series_col=series_col)
         if grouped.empty:
+            no_data_text = "No data available for the requested graph because the aggregated result is empty."
+            if intent.request_kind == "graph":
+                title = f"{_METRIC_LABELS[intent.metric]} ({intent.chart_type})"
+                return self._build_no_data_output(
+                    intent=intent,
+                    text=no_data_text,
+                    title=title,
+                    reason="Grouped result has no usable points",
+                    filtered_rows=int(len(filtered)),
+                    total_rows=int(len(working)),
+                    applied_filters=applied_filters,
+                    date_window=date_window,
+                    missing_requirements=[],
+                )
             return BuildOutput(
                 kind="text",
-                text="No data available for the requested graph because the aggregated result is empty.",
+                text=no_data_text,
                 data=None,
                 figure=None,
                 chart_type=None,
@@ -648,6 +691,44 @@ class GraphAgent:
             date_window=date_window,
             missing_requirements=[],
             data_unavailable=False,
+        )
+
+    def _build_no_data_output(
+        self,
+        intent: AgenticQueryIntent,
+        text: str,
+        title: str,
+        reason: str,
+        filtered_rows: int,
+        total_rows: int,
+        applied_filters: dict[str, list[str]],
+        date_window: dict[str, str | None],
+        missing_requirements: list[str],
+    ) -> BuildOutput:
+        fig = go.Figure()
+        fig.add_annotation(
+            text=f"No data available<br><sup>{reason}</sup>",
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+            font={"size": 14},
+        )
+        fig.update_layout(title=title, xaxis={"visible": False}, yaxis={"visible": False})
+        return BuildOutput(
+            kind="chart",
+            text=text,
+            data=pd.DataFrame(),
+            figure=fig,
+            chart_type=intent.chart_type,
+            chart_title=title,
+            filtered_rows=filtered_rows,
+            total_rows=total_rows,
+            applied_filters=applied_filters,
+            date_window=date_window,
+            missing_requirements=missing_requirements,
+            data_unavailable=True,
         )
 
     def _series_breakdown_column(self, df: pd.DataFrame, intent: AgenticQueryIntent) -> str | None:
@@ -926,6 +1007,9 @@ class ValidatorAgent:
         self.client, self.model = _openai_client()
 
     def validate(self, query: str, intent: AgenticQueryIntent, output: BuildOutput) -> dict[str, Any]:
+        if output.data_unavailable and intent.request_kind == "graph" and output.kind == "chart" and output.figure is not None:
+            return {"is_valid": True, "issues": [], "llm_validator_used": False}
+
         issues: list[str] = []
 
         if output.data_unavailable:

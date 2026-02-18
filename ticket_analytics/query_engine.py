@@ -363,6 +363,19 @@ def _openai_client() -> tuple[Any | None, str | None]:
         return None, None
 
 
+def llm_status() -> dict[str, Any]:
+    model = os.getenv("TICKETX_LLM_MODEL", "gpt-4.1-mini")
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {"enabled": False, "model": model, "reason": "OPENAI_API_KEY not configured"}
+    try:
+        import openai  # noqa: F401
+
+        return {"enabled": True, "model": model, "reason": None}
+    except Exception as exc:
+        return {"enabled": False, "model": model, "reason": f"OpenAI client unavailable: {exc}"}
+
+
 class IntentAgent:
     """Planner agent: converts user query into an execution intent."""
 
@@ -1187,7 +1200,7 @@ def answer_query(query: str, df: pd.DataFrame) -> QueryResult:
         return QueryResult(
             kind="clarification",
             text=clarification,
-            agent_trace={"intent": asdict(intent), "source": "clarification_agent"},
+            agent_trace={"intent": asdict(intent), "source": "clarification_agent", "llm_status": llm_status()},
         )
 
     graph_agent = GraphAgent(df)
@@ -1231,6 +1244,7 @@ def answer_query(query: str, df: pd.DataFrame) -> QueryResult:
         agent_trace={
             "intent": asdict(intent),
             "validation": validation,
+            "llm_status": llm_status(),
             "applied_filters": output.applied_filters,
             "date_window": output.date_window,
             "filtered_rows": output.filtered_rows,

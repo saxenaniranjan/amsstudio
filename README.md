@@ -136,6 +136,7 @@ Notes:
 - `vercel.json` handles API routing and SPA fallback.
 - If you set `VITE_API_URL`, it will override same-origin API calls.
 - Session cache defaults to `/tmp/ticketx_session_cache` on Vercel; if cache write fails, ingestion still succeeds and returns a warning.
+- For serverless resilience, process response includes a compressed `session_snapshot` used to recover sessions when memory/disk cache is unavailable.
 
 ## Troubleshooting
 

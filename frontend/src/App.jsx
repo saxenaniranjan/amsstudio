@@ -138,6 +138,7 @@ function nowIso() {
 function buildEmptyTicketX() {
   return {
     sessionId: "",
+    sessionSnapshot: "",
     columns: [],
     mapping: {},
     mappingSuggestions: {},
@@ -994,6 +995,10 @@ function OutputBox({ output }) {
     return null;
   }
 
+  const plannerSource = output.agent_trace?.intent?.source || "";
+  const llmMeta = output.agent_trace?.llm_status || null;
+  const plannerMode = plannerSource.includes("llm") ? "LLM Planner" : "Rule Planner";
+
   return (
     <section className="panel">
       {output.kind === "clarification" ? (
@@ -1009,6 +1014,13 @@ function OutputBox({ output }) {
             ? "Validator Agent: Passed"
             : `Validator Agent: ${output.agent_trace.validation.issues.join("; ")}`}
         </div>
+      ) : null}
+      {output.agent_trace ? (
+        <p className="summary-lede">
+          {`Planner: ${plannerMode}`}
+          {llmMeta ? ` | LLM Configured: ${llmMeta.enabled ? "Yes" : "No"} (${llmMeta.model})` : ""}
+          {llmMeta?.reason ? ` | ${llmMeta.reason}` : ""}
+        </p>
       ) : null}
 
       {output.findings?.length ? (
@@ -1126,6 +1138,7 @@ function ChatBotPage() {
   const [sla, setSla] = useState(storedTicketX.sla || { ...DEFAULT_SLA });
 
   const [sessionId, setSessionId] = useState(storedTicketX.sessionId || "");
+  const [sessionSnapshot, setSessionSnapshot] = useState(storedTicketX.sessionSnapshot || "");
   const [overview, setOverview] = useState(storedTicketX.overview || null);
   const [selectedFilters, setSelectedFilters] = useState(storedTicketX.selectedFilters || {});
   const [dateRange, setDateRange] = useState(storedTicketX.dateRange || { start: "", end: "" });
@@ -1153,6 +1166,7 @@ function ChatBotPage() {
   useEffect(() => {
     api.patchTicketX(workspace.id, {
       sessionId,
+      sessionSnapshot,
       columns,
       mappingSuggestions,
       mapping,
@@ -1167,6 +1181,7 @@ function ChatBotPage() {
     api,
     workspace.id,
     sessionId,
+    sessionSnapshot,
     columns,
     mappingSuggestions,
     mapping,
@@ -1205,6 +1220,7 @@ function ChatBotPage() {
       filters: selectedFilters,
       start_date: dateRange.start || null,
       end_date: dateRange.end || null,
+      session_snapshot: sessionSnapshot || null,
     };
   }
 
@@ -1214,6 +1230,7 @@ function ChatBotPage() {
       return false;
     }
     setSessionId("");
+    setSessionSnapshot("");
     setOverview(null);
     setGraphs({});
     setOutput(null);
@@ -1280,6 +1297,7 @@ function ChatBotPage() {
       });
 
       const nextSessionId = response.session_id;
+      const nextSessionSnapshot = response.session_snapshot || "";
       const nextOverview = { ...response.overview, columns: response.columns };
       const nextFilters = normalizeFiltersFromOverview(nextOverview);
       const min = response.overview?.date_range?.min?.slice(0, 10) || "";
@@ -1290,6 +1308,7 @@ function ChatBotPage() {
       }));
 
       setSessionId(nextSessionId);
+      setSessionSnapshot(nextSessionSnapshot);
       setOverview(nextOverview);
       setSelectedFilters(nextFilters);
       setDateRange({ start: min, end: max });
@@ -1352,6 +1371,27 @@ function ChatBotPage() {
     const payload = filterPayload || buildFilterPayload();
     const outputById = {};
     let sessionMissing = false;
+    let failedCount = 0;
+    let firstError = "";
+
+    const buildGraphErrorFigure = (title, detail) => ({
+      data: [],
+      layout: {
+        title,
+        annotations: [
+          {
+            text: detail || "Chart unavailable for current selection.",
+            x: 0.5,
+            y: 0.5,
+            xref: "paper",
+            yref: "paper",
+            showarrow: false,
+          },
+        ],
+        xaxis: { visible: false },
+        yaxis: { visible: false },
+      },
+    });
 
     await Promise.all(
       DASHBOARD_GRAPHS.map(async (graphMeta) => {
@@ -1359,30 +1399,50 @@ function ChatBotPage() {
           const graph = await fetchGraph(targetSession, { graph_id: graphMeta.id, ...payload });
           outputById[graphMeta.id] = graph;
         } catch (error) {
-          const detail = error?.response?.data?.detail || "";
+          const detail = error?.response?.data?.detail || error?.message || "Unable to load graph.";
           if (String(detail).toLowerCase().includes("session not found")) {
             sessionMissing = true;
           }
-          outputById[graphMeta.id] = null;
+          failedCount += 1;
+          if (!firstError) {
+            firstError = detail;
+          }
+          outputById[graphMeta.id] = {
+            graph_id: graphMeta.id,
+            title: graphMeta.title,
+            insight_hint: detail,
+            figure: buildGraphErrorFigure(graphMeta.title, detail),
+            data: [],
+          };
         }
       })
     );
 
+    setGraphs(outputById);
+
     if (sessionMissing) {
       throw new Error("Session not found");
     }
-
-    setGraphs(outputById);
+    if (failedCount > 0) {
+      throw new Error(`Unable to load ${failedCount} graph(s): ${firstError}`);
+    }
   }
 
   useEffect(() => {
     if (showDashboard && sessionId && Object.keys(graphs).length === 0) {
       setLoading(true);
       setStatus("Loading PRD graph catalog...");
-      loadAllGraphs().finally(() => {
-        setLoading(false);
-        setStatus("Dashboard loaded.");
-      });
+      loadAllGraphs()
+        .then(() => setStatus("Dashboard loaded."))
+        .catch((error) => {
+          if (handleSessionNotFound(error)) {
+            return;
+          }
+          setStatus(error?.response?.data?.detail || error?.message || "Unable to load dashboard.");
+        })
+        .finally(() => {
+          setLoading(false);
+        });
     }
   }, [showDashboard, sessionId, graphs]);
 

@@ -6,9 +6,12 @@ import json
 import math
 import os
 import uuid
+import gzip
+import base64
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
+from io import StringIO
 from pathlib import Path
 from typing import Any, Optional
 
@@ -24,6 +27,7 @@ from .graph_catalog import build_composite_graph, build_prd_graph, build_word_cl
 from .insights import build_insight_report
 from .pipeline import run_ticket_pipeline
 from .prd_metrics import build_prd_cards
+from .query_engine import llm_status
 from .workspace import build_upload_history_entry, suggest_global_filters, suggest_mapping_candidates
 
 
@@ -37,6 +41,7 @@ class SessionData:
 
 
 SESSION_STORE: dict[str, SessionData] = {}
+MAX_SESSION_SNAPSHOT_CHARS = int(os.getenv("TICKETX_SNAPSHOT_MAX_CHARS", "2500000"))
 
 
 def _cache_dir() -> Path:
@@ -97,6 +102,7 @@ class FilterPayload(BaseModel):
     filters: dict[str, list[str]] = Field(default_factory=dict)
     start_date: Optional[str] = None
     end_date: Optional[str] = None
+    session_snapshot: Optional[str] = None
 
 
 class GraphPayload(FilterPayload):
@@ -113,6 +119,30 @@ class CompositePayload(FilterPayload):
     y_col: str
     chart_type: str
     color_col: Optional[str] = None
+
+
+def _coerce_datetime_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in ["created_at", "resolved_at", "updated_at"]:
+        if col in out.columns:
+            out[col] = pd.to_datetime(out[col], errors="coerce")
+    return out
+
+
+def _serialize_session_snapshot(df: pd.DataFrame) -> str:
+    json_blob = df.to_json(orient="split", date_format="iso")
+    compressed = gzip.compress(json_blob.encode("utf-8"), compresslevel=6)
+    return base64.urlsafe_b64encode(compressed).decode("ascii")
+
+
+def _deserialize_session_snapshot(snapshot: str) -> pd.DataFrame | None:
+    try:
+        compressed = base64.urlsafe_b64decode(snapshot.encode("ascii"))
+        json_blob = gzip.decompress(compressed).decode("utf-8")
+        frame = pd.read_json(StringIO(json_blob), orient="split")
+        return _coerce_datetime_columns(frame)
+    except Exception:
+        return None
 
 
 def _parse_json(text: str, default: dict[str, Any]) -> dict[str, Any]:
@@ -238,15 +268,35 @@ def _apply_filters(df: pd.DataFrame, payload: FilterPayload) -> pd.DataFrame:
     return filtered
 
 
-def _get_session(session_id: str) -> SessionData:
+def _get_session_with_fallback(session_id: str, session_snapshot: str | None = None) -> SessionData:
     session = SESSION_STORE.get(session_id)
-    if session is None:
-        restored = _load_session_from_disk(session_id)
-        if restored is None:
-            raise HTTPException(status_code=404, detail="Session not found")
+    if session is not None:
+        return session
+
+    restored = _load_session_from_disk(session_id)
+    if restored is not None:
         SESSION_STORE[session_id] = restored
-        session = restored
-    return session
+        return restored
+
+    if session_snapshot:
+        frame = _deserialize_session_snapshot(session_snapshot)
+        if frame is not None and not frame.empty:
+            recovered = SessionData(
+                session_id=session_id,
+                workspace_name="Recovered Workspace",
+                created_at=datetime.now().isoformat(),
+                enriched_df=frame,
+                upload_history=[],
+            )
+            SESSION_STORE[session_id] = recovered
+            _persist_session(recovered)
+            return recovered
+
+    raise HTTPException(status_code=404, detail="Session not found. Please reprocess workspace.")
+
+
+def _get_session(session_id: str) -> SessionData:
+    return _get_session_with_fallback(session_id=session_id, session_snapshot=None)
 
 
 def _format_file_errors(file_errors: list[dict[str, str]], limit: int = 3) -> str:
@@ -299,8 +349,14 @@ def create_app() -> FastAPI:
     )
 
     @app.get("/api/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    def health() -> dict[str, Any]:
+        status = llm_status()
+        return {
+            "status": "ok",
+            "llm_enabled": status.get("enabled", False),
+            "llm_model": status.get("model"),
+            "llm_reason": status.get("reason"),
+        }
 
     @app.post("/api/sessions/process")
     async def process_session(
@@ -354,6 +410,22 @@ def create_app() -> FastAPI:
             upload_history=upload_history,
         )
         session_warning = _persist_session(SESSION_STORE[session_id])
+        session_snapshot = None
+        snapshot_warning = None
+        if os.getenv("VERCEL") or bool(session_warning):
+            try:
+                candidate_snapshot = _serialize_session_snapshot(enriched)
+                if len(candidate_snapshot) <= MAX_SESSION_SNAPSHOT_CHARS:
+                    session_snapshot = candidate_snapshot
+                else:
+                    snapshot_warning = (
+                        "Session snapshot omitted due size limits; reprocess may be required after serverless cold start."
+                    )
+            except Exception as exc:  # pragma: no cover - environment dependent
+                snapshot_warning = f"Session snapshot unavailable: {exc}"
+
+        warnings = [w for w in [session_warning, snapshot_warning] if w]
+        combined_warning = " | ".join(warnings) if warnings else None
 
         payload = {
             "session_id": session_id,
@@ -362,7 +434,8 @@ def create_app() -> FastAPI:
             "columns": list(enriched.columns),
             "upload_history": upload_history,
             "file_errors": file_errors,
-            "session_warning": session_warning,
+            "session_warning": combined_warning,
+            "session_snapshot": session_snapshot,
             "overview": _overview_payload(enriched),
         }
         return JSONResponse(content=payload)
@@ -401,13 +474,13 @@ def create_app() -> FastAPI:
 
     @app.post("/api/sessions/{session_id}/overview")
     def get_overview(session_id: str, payload: FilterPayload) -> JSONResponse:
-        session = _get_session(session_id)
+        session = _get_session_with_fallback(session_id, payload.session_snapshot)
         filtered = _apply_filters(session.enriched_df, payload)
         return JSONResponse(content=_overview_payload(filtered))
 
     @app.post("/api/sessions/{session_id}/graphs")
     def get_graph(session_id: str, payload: GraphPayload) -> JSONResponse:
-        session = _get_session(session_id)
+        session = _get_session_with_fallback(session_id, payload.session_snapshot)
         filtered = _apply_filters(session.enriched_df, payload)
 
         output = build_prd_graph(
@@ -429,14 +502,14 @@ def create_app() -> FastAPI:
 
     @app.post("/api/sessions/{session_id}/word-cloud")
     def get_word_cloud(session_id: str, payload: FilterPayload) -> JSONResponse:
-        session = _get_session(session_id)
+        session = _get_session_with_fallback(session_id, payload.session_snapshot)
         filtered = _apply_filters(session.enriched_df, payload)
         fig = build_word_cloud_plotly(filtered)
         return JSONResponse(content={"figure": _figure_to_json(fig)})
 
     @app.post("/api/sessions/{session_id}/composite")
     def get_composite(session_id: str, payload: CompositePayload) -> JSONResponse:
-        session = _get_session(session_id)
+        session = _get_session_with_fallback(session_id, payload.session_snapshot)
         filtered = _apply_filters(session.enriched_df, payload)
         fig = build_composite_graph(
             filtered,
@@ -449,7 +522,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/sessions/{session_id}/query")
     def run_query(session_id: str, payload: QueryPayload) -> JSONResponse:
-        session = _get_session(session_id)
+        session = _get_session_with_fallback(session_id, payload.session_snapshot)
         filtered = _apply_filters(session.enriched_df, payload)
 
         mode = payload.mode.lower().strip()

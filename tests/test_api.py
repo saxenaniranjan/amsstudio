@@ -247,3 +247,53 @@ def test_api_process_succeeds_when_persist_session_fails(raw_ticket_df, monkeypa
     payload = response.json()
     assert payload.get("session_warning")
     assert "persistence unavailable" in payload["session_warning"].lower()
+
+
+def test_session_restores_from_snapshot_when_store_and_disk_missing(raw_ticket_df, monkeypatch) -> None:
+    monkeypatch.setenv("VERCEL", "1")
+    client = TestClient(app)
+    excel_bytes = _to_excel_bytes(raw_ticket_df)
+
+    process_response = client.post(
+        "/api/sessions/process",
+        data={
+            "workspace_name": "Snapshot Workspace",
+            "user_mapping": json.dumps({}),
+            "sla_threshold_hours": json.dumps({"P1": 4, "P2": 8, "P3": 24, "P4": 72}),
+        },
+        files=[
+            (
+                "files",
+                (
+                    "tickets.xlsx",
+                    excel_bytes,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ),
+            )
+        ],
+    )
+    assert process_response.status_code == 200
+    payload = process_response.json()
+    session_id = payload["session_id"]
+    snapshot = payload.get("session_snapshot")
+    assert snapshot
+
+    api_server_module.SESSION_STORE.clear()
+    monkeypatch.setattr(api_server_module, "_load_session_from_disk", lambda _session_id: None)
+
+    overview_response = client.post(
+        f"/api/sessions/{session_id}/overview",
+        json={"filters": {}, "start_date": None, "end_date": None, "session_snapshot": snapshot},
+    )
+    assert overview_response.status_code == 200
+    assert session_id in api_server_module.SESSION_STORE
+
+
+def test_health_reports_llm_runtime_metadata() -> None:
+    client = TestClient(app)
+    response = client.get("/api/health")
+    assert response.status_code == 200
+    payload = response.json()
+    assert "status" in payload
+    assert "llm_enabled" in payload
+    assert "llm_model" in payload

@@ -121,6 +121,21 @@ cd /Users/niranjansaxena/Desktop/AMS
 npm run build
 ```
 
+## Deploy On Vercel
+
+This repo is now configured to deploy both frontend and backend in one Vercel project:
+- React SPA build from `/Users/niranjansaxena/Desktop/AMS/frontend`
+- FastAPI backend as a Python function from `/Users/niranjansaxena/Desktop/AMS/api/index.py`
+- Frontend calls same-origin `/api/*` in production by default
+
+Required Vercel environment variables:
+- `OPENAI_API_KEY`
+- `TICKETX_LLM_MODEL` (optional, default `gpt-4.1-mini`)
+
+Notes:
+- `vercel.json` handles API routing and SPA fallback.
+- If you set `VITE_API_URL`, it will override same-origin API calls.
+
 ## Troubleshooting
 
 - If `npm run dev` fails with `Address already in use`, another process is already running on port `8010` or `5173`.

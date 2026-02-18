@@ -27,19 +27,33 @@ def list_prd_graphs() -> dict[str, str]:
     return PRD_GRAPH_IDS
 
 
+def _normalize_datetime_series(series: pd.Series) -> pd.Series:
+    parsed = pd.to_datetime(series, errors="coerce", utc=True)
+    return parsed.dt.tz_convert(None)
+
+
 def _resample_count(frame: pd.DataFrame, datetime_col: str, freq: str, value_name: str) -> pd.DataFrame:
-    if datetime_col not in frame or frame[datetime_col].isna().all():
+    if datetime_col not in frame:
+        return pd.DataFrame(columns=["period", value_name])
+    normalized = _normalize_datetime_series(frame[datetime_col])
+    if normalized.isna().all():
         return pd.DataFrame(columns=["period", value_name])
 
-    return (
-        frame.dropna(subset=[datetime_col])
-        .set_index(datetime_col)
-        .resample(freq)
-        .size()
-        .rename(value_name)
-        .reset_index()
-        .rename(columns={datetime_col: "period"})
-    )
+    working = frame.copy()
+    working[datetime_col] = normalized
+
+    try:
+        return (
+            working.dropna(subset=[datetime_col])
+            .set_index(datetime_col)
+            .resample(freq)
+            .size()
+            .rename(value_name)
+            .reset_index()
+            .rename(columns={datetime_col: "period"})
+        )
+    except Exception:
+        return pd.DataFrame(columns=["period", value_name])
 
 
 def _graph_1_ticket_trend(df: pd.DataFrame, freq: str) -> GraphOutput:
@@ -318,6 +332,10 @@ def _graph_8_time_trend_heatmap(df: pd.DataFrame) -> GraphOutput:
 
 def build_prd_graph(df: pd.DataFrame, graph_id: str, start: pd.Timestamp | None = None, end: pd.Timestamp | None = None) -> GraphOutput:
     working = df.copy()
+    for dt_col in ["created_at", "resolved_at", "updated_at", "closed_at"]:
+        if dt_col in working.columns:
+            working[dt_col] = _normalize_datetime_series(working[dt_col])
+
     if start is not None and "created_at" in working:
         working = working[working["created_at"] >= pd.Timestamp(start)]
     if end is not None and "created_at" in working:

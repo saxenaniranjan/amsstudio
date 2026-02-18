@@ -297,3 +297,45 @@ def test_health_reports_llm_runtime_metadata() -> None:
     assert "status" in payload
     assert "llm_enabled" in payload
     assert "llm_model" in payload
+
+
+def test_graph_endpoint_returns_fallback_payload_when_graph_generation_fails(raw_ticket_df, monkeypatch) -> None:
+    client = TestClient(app)
+    excel_bytes = _to_excel_bytes(raw_ticket_df)
+
+    process_response = client.post(
+        "/api/sessions/process",
+        data={
+            "workspace_name": "Fallback Graph Workspace",
+            "user_mapping": json.dumps({}),
+            "sla_threshold_hours": json.dumps({"P1": 4, "P2": 8, "P3": 24, "P4": 72}),
+        },
+        files=[
+            (
+                "files",
+                (
+                    "tickets.xlsx",
+                    excel_bytes,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ),
+            )
+        ],
+    )
+    assert process_response.status_code == 200
+    session_id = process_response.json()["session_id"]
+
+    def _raise_graph_failure(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(api_server_module, "build_prd_graph", _raise_graph_failure)
+
+    graph_response = client.post(
+        f"/api/sessions/{session_id}/graphs",
+        json={"graph_id": "graph_1", "filters": {}, "start_date": None, "end_date": None},
+    )
+    assert graph_response.status_code == 200
+    payload = graph_response.json()
+    assert payload["graph_id"] == "graph_1"
+    assert payload["title"]
+    assert payload["figure"]["data"] == []
+    assert "graph generation failed" in payload["insight_hint"].lower()

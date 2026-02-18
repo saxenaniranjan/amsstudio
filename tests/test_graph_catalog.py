@@ -59,3 +59,16 @@ def test_graph_1_falls_back_to_updated_or_resolved_when_created_missing(raw_tick
     output = build_prd_graph(fallback_df, "graph_1")
     assert output.figure is not None
     assert not output.data.empty
+
+
+def test_graph_1_handles_mixed_timezone_datetime_inputs(raw_ticket_df, reference_time) -> None:
+    enriched = run_ticket_pipeline(raw_ticket_df, reference_time=reference_time).copy()
+    mixed = enriched.copy()
+    mixed["created_at"] = mixed["created_at"].astype(str)
+    if len(mixed) >= 2:
+        mixed.loc[mixed.index[0], "created_at"] = "2026-01-01T00:00:00Z"
+        mixed.loc[mixed.index[1], "created_at"] = "2026-01-02 00:00:00"
+
+    output = build_prd_graph(mixed, "graph_1")
+    assert output.figure is not None
+    assert {"period", "inflow", "outflow", "backlog"}.issubset(set(output.data.columns))

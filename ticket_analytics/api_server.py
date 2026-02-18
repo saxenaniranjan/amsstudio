@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .agentic import build_summary_export, run_autonomous_mode, run_enabler_mode
+from .constants import PRD_GRAPH_IDS
 from .graph_catalog import build_composite_graph, build_prd_graph, build_word_cloud_plotly
 from .insights import build_insight_report
 from .pipeline import run_ticket_pipeline
@@ -238,6 +239,27 @@ def _json_safe(value: Any) -> Any:
             return None
         return value
     return value
+
+
+def _fallback_graph_figure(title: str, detail: str) -> dict[str, Any]:
+    return {
+        "data": [],
+        "layout": {
+            "title": title,
+            "annotations": [
+                {
+                    "text": detail or "Chart unavailable for current selection.",
+                    "x": 0.5,
+                    "y": 0.5,
+                    "xref": "paper",
+                    "yref": "paper",
+                    "showarrow": False,
+                }
+            ],
+            "xaxis": {"visible": False},
+            "yaxis": {"visible": False},
+        },
+    }
 
 
 def _apply_filters(df: pd.DataFrame, payload: FilterPayload) -> pd.DataFrame:
@@ -482,21 +504,46 @@ def create_app() -> FastAPI:
     def get_graph(session_id: str, payload: GraphPayload) -> JSONResponse:
         session = _get_session_with_fallback(session_id, payload.session_snapshot)
         filtered = _apply_filters(session.enriched_df, payload)
+        start = None
+        end = None
+        if payload.start_date:
+            try:
+                start = pd.Timestamp(payload.start_date)
+            except Exception:
+                start = None
+        if payload.end_date:
+            try:
+                end = pd.Timestamp(payload.end_date)
+            except Exception:
+                end = None
 
-        output = build_prd_graph(
-            filtered,
-            payload.graph_id,
-            start=pd.Timestamp(payload.start_date) if payload.start_date else None,
-            end=pd.Timestamp(payload.end_date) if payload.end_date else None,
-        )
+        try:
+            output = build_prd_graph(filtered, payload.graph_id, start=start, end=end)
+            return JSONResponse(
+                content={
+                    "graph_id": output.graph_id,
+                    "title": output.title,
+                    "insight_hint": output.insight_hint,
+                    "figure": _figure_to_json(output.figure),
+                    "data": _df_to_records(output.data, limit=500),
+                }
+            )
+        except ValueError as exc:
+            if "unsupported graph id" in str(exc).lower():
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            detail = f"Graph generation failed: {exc}"
+        except Exception as exc:  # pragma: no cover - defensive runtime fallback
+            detail = f"Graph generation failed: {exc}"
 
+        graph_id = str(payload.graph_id or "").strip().lower()
+        title = PRD_GRAPH_IDS.get(graph_id, graph_id or "Graph")
         return JSONResponse(
             content={
-                "graph_id": output.graph_id,
-                "title": output.title,
-                "insight_hint": output.insight_hint,
-                "figure": _figure_to_json(output.figure),
-                "data": _df_to_records(output.data, limit=500),
+                "graph_id": graph_id,
+                "title": title,
+                "insight_hint": detail,
+                "figure": _fallback_graph_figure(title, detail),
+                "data": [],
             }
         )
 

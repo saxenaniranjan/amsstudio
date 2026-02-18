@@ -1349,8 +1349,15 @@ function ChatBotPage() {
       const data = await fetchOverview(sessionId, buildFilterPayload());
       const merged = { ...data, columns: overview?.columns || [] };
       setOverview(merged);
-      await loadAllGraphs(sessionId, buildFilterPayload());
-      setStatus("Dashboard updated with selected filters.");
+      const graphLoad = await loadAllGraphs(sessionId, buildFilterPayload());
+      if (graphLoad.failedCount > 0) {
+        const graphError = graphLoad.firstError || "See graph cards for details.";
+        setStatus(
+          `Dashboard updated with warnings: ${graphLoad.failedCount} graph(s) unavailable. ${graphError}`
+        );
+      } else {
+        setStatus("Dashboard updated with selected filters.");
+      }
     } catch (error) {
       if (handleSessionNotFound(error)) {
         return;
@@ -1365,7 +1372,7 @@ function ChatBotPage() {
   async function loadAllGraphs(activeSession, filterPayload) {
     const targetSession = activeSession || sessionId;
     if (!targetSession) {
-      return;
+      return { failedCount: 0, firstError: "" };
     }
 
     const payload = filterPayload || buildFilterPayload();
@@ -1423,9 +1430,7 @@ function ChatBotPage() {
     if (sessionMissing) {
       throw new Error("Session not found");
     }
-    if (failedCount > 0) {
-      throw new Error(`Unable to load ${failedCount} graph(s): ${firstError}`);
-    }
+    return { failedCount, firstError };
   }
 
   useEffect(() => {
@@ -1433,7 +1438,16 @@ function ChatBotPage() {
       setLoading(true);
       setStatus("Loading PRD graph catalog...");
       loadAllGraphs()
-        .then(() => setStatus("Dashboard loaded."))
+        .then((graphLoad) => {
+          if (graphLoad.failedCount > 0) {
+            const graphError = graphLoad.firstError || "See graph cards for details.";
+            setStatus(
+              `Dashboard loaded with warnings: ${graphLoad.failedCount} graph(s) unavailable. ${graphError}`
+            );
+          } else {
+            setStatus("Dashboard loaded.");
+          }
+        })
         .catch((error) => {
           if (handleSessionNotFound(error)) {
             return;

@@ -1,5 +1,6 @@
 """Ticket analytics platform package."""
 
-from .pipeline import run_ticket_pipeline, TicketAnalysisSession
+from .pipeline import TicketAnalysisSession, run_ticket_pipeline
+from .prd_metrics import build_prd_cards
 
-__all__ = ["run_ticket_pipeline", "TicketAnalysisSession"]
+__all__ = ["TicketAnalysisSession", "run_ticket_pipeline", "build_prd_cards"]

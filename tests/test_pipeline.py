@@ -19,5 +19,6 @@ def test_session_and_plotly_figure(raw_ticket_df, reference_time) -> None:
 
     assert result.kind == "chart"
     assert result.chart is not None
-    assert result.chart["type"] == "line"
+    assert result.chart["type"] == "plotly_figure"
+    assert result.chart["chart_type"] == "line"
     assert fig is not None

@@ -1,58 +1,133 @@
-# ITIL Ticket Analytics Platform
+# AMS Studio Replica (React + FastAPI)
 
-A complete analytics platform for ITIL ticket dumps (Excel/CSV) with:
-- robust preprocessing for messy exports,
-- derived analyst-grade columns (Category, Business Function, MTTR, SLA Risk, Team Performance),
-- natural-language query interface for insights and charts,
-- unified graphing through **Plotly** (single chart library),
-- automated test suite.
+PRD-aligned ITIL ticket analytics platform that replicates the AMS Studio flow:
+- Login
+- Workspace list/create/edit
+- Workspace settings (users, file storage, integrations)
+- Ticket-X launch
+- Data ingestion, mapping, SLA setup
+- Dashboard + graph catalog + agentic query interface
 
-## What It Does
+All charts use **Plotly** as the single graphing library.
 
-1. Ingests ticket dumps from common ITIL tools.
-2. Normalizes columns and auto-maps aliases (`Incident ID`, `Assignment Group`, etc.).
-3. Derives missing business columns:
-   - `category_derived`
-   - `business_function_derived`
-   - `mttr_hours`
-   - `ticket_age_hours`
-   - `resolution_bucket`
-   - `sla_threshold_hours`
-   - `is_sla_breached`
-   - `sla_risk`
-   - `team_performance_index`
-   - `team_performance_band`
-4. Produces analyst-style outputs:
-   - KPI summary,
-   - anomaly detection in daily ticket volume,
-   - actionable recommendations.
-5. Supports free-form queries like:
-   - "show bar chart of ticket count by team"
-   - "top 5 categories by breach rate"
-   - "recommend actions to reduce MTTR"
+## Stack
 
-## Run Locally
+- Frontend: React + Vite (`/Users/niranjansaxena/Desktop/AMS/frontend`)
+- Backend: FastAPI (`/Users/niranjansaxena/Desktop/AMS/app.py`)
+- Analytics engine: Pandas + Plotly (`/Users/niranjansaxena/Desktop/AMS/ticket_analytics`)
+
+## Run (Single Command)
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .[dev]
-streamlit run app.py
+cd /Users/niranjansaxena/Desktop/AMS
+npm run setup
+npm run dev
 ```
 
-## Run Tests
+This starts:
+- Backend: `http://127.0.0.1:8010`
+- Frontend: `http://127.0.0.1:5173` (or next available port)
+
+## Alternative Run (Two Terminals)
+
+Terminal 1:
+```bash
+cd /Users/niranjansaxena/Desktop/AMS
+npm run backend
+```
+
+Terminal 2:
+```bash
+cd /Users/niranjansaxena/Desktop/AMS
+npm run frontend
+```
+
+## Login Credentials
+
+Use the same credentials you shared for AMS flow testing:
+- Email: `niranjan.saxena@coforge.com`
+- Password: `test123`
+
+## Core Features Implemented
+
+- Upload Excel/CSV ticket dumps.
+- Mandatory mapping for:
+  - Incident Number
+  - Assignment Group
+  - Application
+- SLA mapping by priority (`P1`..`P4`).
+- Robust preprocessing:
+  - Alias normalization for common ITIL exports
+  - Extended optional PRD fields (domain/sub-domain/subcategory/customer/environment/etc.)
+  - MTTR fallback to `resolution_time` when timestamp delta is zero/missing
+- Derived fields:
+  - `category_derived`
+  - `business_function_derived`
+  - `mttr_hours`
+  - `ticket_age_days`
+  - `is_sla_breached`
+  - `is_recurring_issue`
+  - `team_performance_index`
+- PRD dashboard card groups:
+  - Incident Volumetrics
+  - Delivery Compliance
+  - Efficiency
+  - Incident Composition
+  - Performance
+- PRD graph catalog (`Graph 1` to `Graph 8`) + insights.
+- Agentic query modes:
+  - Summarize Data
+  - Auto Detect Issues
+  - Enabler free-form query
+- Multi-agent LLM query execution:
+  - `IntentAgent` detects graph intent, metric, filters, and time window.
+  - `GraphAgent` slices data, derives missing analytical columns when possible, and builds Plotly charts.
+  - `ValidatorAgent` validates the generated output and returns explicit issues when data is unavailable.
+- Custom graphs:
+  - Word-cloud style Plotly view
+  - Composite graph builder
+- Exports:
+  - Enriched CSV
+  - Summary JSON
+- Session resiliency:
+  - Processed sessions are cached locally so dashboard/query calls survive backend restarts.
+
+## Tests
+
+Run backend tests:
 
 ```bash
-pytest
+cd /Users/niranjansaxena/Desktop/AMS
+npm run test
 ```
 
-## Project Structure
+Current status: all tests pass (`24 passed`).
 
-- `app.py`: Streamlit UI
-- `ticket_analytics/preprocessing.py`: ingestion and normalization
-- `ticket_analytics/features.py`: derived feature logic
-- `ticket_analytics/insights.py`: KPI, anomaly, recommendation engine
-- `ticket_analytics/query_engine.py`: NL query parsing and slicing
-- `ticket_analytics/visualization.py`: Plotly chart generation (single library)
-- `ticket_analytics/pipeline.py`: orchestration session/pipeline API
-- `tests/`: end-to-end and unit tests
+## LLM Configuration
+
+Set these env vars to enable LLM planner/validator agents:
+
+```bash
+export OPENAI_API_KEY="<your_api_key>"
+export TICKETX_LLM_MODEL="gpt-4.1-mini"
+```
+
+If `OPENAI_API_KEY` is not set, deterministic fallback agents are used.
+
+## Build Frontend
+
+```bash
+cd /Users/niranjansaxena/Desktop/AMS
+npm run build
+```
+
+## Troubleshooting
+
+- If `npm run dev` fails with `Address already in use`, another process is already running on port `8010` or `5173`.
+- Stop existing local servers and rerun. The script now stops both processes automatically if backend startup fails.
+- If you still see `Session not found`, reprocess the file once. The UI now auto-resets stale sessions and prompts reprocessing.
+- Health check endpoint:
+
+```bash
+curl http://127.0.0.1:8010/api/health
+```

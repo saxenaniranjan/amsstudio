@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
 
@@ -24,6 +23,12 @@ def build_overview_metrics(df: pd.DataFrame) -> dict[str, float | int]:
     median_mttr = float(df["mttr_hours"].median()) if "mttr_hours" in df and df["mttr_hours"].notna().any() else 0.0
     breach_rate = _safe_ratio(breached, total)
 
+    recurring_pct = (
+        round(float(df["is_recurring_issue"].mean()) * 100.0, 2)
+        if "is_recurring_issue" in df and not df.empty
+        else 0.0
+    )
+
     return {
         "total_tickets": total,
         "open_tickets": open_count,
@@ -32,6 +37,7 @@ def build_overview_metrics(df: pd.DataFrame) -> dict[str, float | int]:
         "breach_rate": round(breach_rate, 4),
         "avg_mttr_hours": round(mttr, 2),
         "median_mttr_hours": round(median_mttr, 2),
+        "recurring_issue_pct": recurring_pct,
     }
 
 
@@ -100,12 +106,17 @@ def generate_recommendations(df: pd.DataFrame) -> list[str]:
                 f"Team '{team_name}' has the lowest performance index. Review queue load balancing and runbook coverage."
             )
 
-    if "sla_risk" in df:
-        high_risk_open = int(((df["sla_risk"] == "High") & df["is_open"]).sum())
+    if "is_at_risk" in df:
+        high_risk_open = int(df["is_at_risk"].sum())
         if high_risk_open > 0:
             recommendations.append(
-                f"There are {high_risk_open} high-risk open tickets. Trigger immediate ownership and daily risk burn-down reviews."
+                f"There are {high_risk_open} at-risk open tickets (>80% SLA elapsed). Trigger immediate ownership and daily burn-down reviews."
             )
+
+    if "is_recurring_issue" in df and metrics["recurring_issue_pct"] > 20:
+        recommendations.append(
+            "Recurring issues exceed 20% of volume. Launch recurring-issue elimination with automation/runbook standardization."
+        )
 
     if not recommendations:
         recommendations.append(
@@ -147,10 +158,24 @@ def build_insight_report(df: pd.DataFrame) -> dict[str, Any]:
         team_summary["performance_index"] = team_summary["performance_index"].round(2)
         team_summary = team_summary.to_dict("records")
 
+    recurring_issues = []
+    if "is_recurring_issue" in df and df["is_recurring_issue"].any():
+        recurring_issues = (
+            df[df["is_recurring_issue"]]
+            .groupby(["issue_signature", "service", "team"], dropna=False)
+            .size()
+            .rename("tickets")
+            .reset_index()
+            .sort_values("tickets", ascending=False)
+            .head(10)
+            .to_dict("records")
+        )
+
     return {
         "metrics": metrics,
         "top_categories": top_categories,
         "team_summary": team_summary,
+        "recurring_issues": recurring_issues,
         "anomalies": find_volume_anomalies(df),
         "recommendations": generate_recommendations(df),
     }

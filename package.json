@@ -1,0 +1,20 @@
+{
+  "name": "ams-platform",
+  "private": true,
+  "version": "0.1.0",
+  "description": "AMS Studio React + FastAPI platform for ITIL ticket analytics",
+  "scripts": {
+    "setup": "python3 -m venv .venv && .venv/bin/python -m pip install --upgrade pip && .venv/bin/python -m pip install '.[dev]' && npm --prefix frontend install",
+    "backend": ".venv/bin/python -m uvicorn app:app --reload --host 127.0.0.1 --port 8000",
+    "backend:8010": ".venv/bin/python -m uvicorn app:app --reload --host 127.0.0.1 --port 8010",
+    "frontend": "npm --prefix frontend run dev -- --host 127.0.0.1 --port 5173",
+    "frontend:8010": "VITE_API_URL=http://127.0.0.1:8010 npm --prefix frontend run dev -- --host 127.0.0.1 --port 5173",
+    "dev": "concurrently --kill-others-on-fail -n backend,frontend -c blue,green \"npm run backend:8010\" \"npm run frontend:8010\"",
+    "dev:8010": "npm run dev",
+    "build": "npm --prefix frontend run build",
+    "test": ".venv/bin/python -m pytest"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

@@ -10,7 +10,15 @@ from .query_engine import QueryResult
 
 
 def build_figure(result: QueryResult) -> Figure | None:
-    if result.chart is None or result.data is None or result.data.empty:
+    if result.chart is None:
+        return None
+
+    # Some flows directly provide the plotly figure.
+    if result.chart.get("type") == "plotly_figure":
+        fig = result.chart.get("figure")
+        return fig if isinstance(fig, Figure) else None
+
+    if result.data is None or result.data.empty:
         return None
 
     chart = result.chart

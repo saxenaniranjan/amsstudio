@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pandas as pd
+
 from ticket_analytics.features import derive_features
 from ticket_analytics.preprocessing import preprocess_tickets
 
@@ -42,3 +44,45 @@ def test_open_ticket_sla_risk(raw_ticket_df, reference_time) -> None:
     open_tickets = enriched[enriched["is_open"]]
     assert not open_tickets.empty
     assert set(open_tickets["sla_risk"].unique()).issubset({"Low", "Medium", "High"})
+
+
+def test_mttr_falls_back_to_resolution_duration_when_timestamp_delta_is_zero(reference_time) -> None:
+    raw = pd.DataFrame(
+        {
+            "Incident Number": ["INC9001"],
+            "Issue Description": ["ERP database issue"],
+            "Assignment Group": ["DBA Team"],
+            "State": ["Closed"],
+            "Priority": ["2"],
+            "Business Service": ["ERP"],
+            "Opened At": ["2026-01-01 10:00:00"],
+            "Resolved At": ["2026-01-01 10:00:00"],
+            "Resolution Duration": ["0 days 04:30:00"],
+            "Reopened": [0],
+        }
+    )
+    pre = preprocess_tickets(raw)
+    enriched = derive_features(pre, reference_time=reference_time)
+
+    assert round(float(enriched.iloc[0]["mttr_hours"]), 2) == 4.5
+
+
+def test_mttr_is_unknown_when_no_delta_and_no_resolution_duration(reference_time) -> None:
+    raw = pd.DataFrame(
+        {
+            "Incident Number": ["INC9002"],
+            "Issue Description": ["Access issue"],
+            "Assignment Group": ["Service Desk"],
+            "State": ["Closed"],
+            "Priority": ["3"],
+            "Business Service": ["Identity"],
+            "Opened At": ["2026-01-01 10:00:00"],
+            "Resolved At": ["2026-01-01 10:00:00"],
+            "Resolution Duration": [None],
+            "Reopened": [0],
+        }
+    )
+    pre = preprocess_tickets(raw)
+    enriched = derive_features(pre, reference_time=reference_time)
+
+    assert pd.isna(enriched.iloc[0]["mttr_hours"])

@@ -190,20 +190,30 @@ def _detect_dimension(query: str, df: pd.DataFrame) -> str | None:
     if "service desk" in q and "team" in df.columns:
         return "team"
 
+    lookback_phrase = re.search(
+        r"\b(?:last|past)\s+(?:\d+\s+)?(?:day|days|week|weeks|month|months|quarter|quarters|year|years)\b",
+        q,
+    )
+
     explicit_patterns = [
-        (r"\b(team|by team|per team|assignment groups?|groupwise)\b", "team"),
-        (r"\b(category|by category|issue category|recurring category)\b", "category_derived"),
-        (r"\b(priority|by priority|per priority|priority wise)\b", "priority"),
-        (r"\b(status|by status)\b", "status"),
+        (r"\b(by team|per team|team wise|assignment groups?|groupwise|by assignment group|per assignment group)\b", "team"),
+        (r"\b(by category|per category|issue category|recurring category|category wise)\b", "category_derived"),
+        (r"\b(by priority|per priority|priority wise|priority trend|priority breakdown)\b", "priority"),
+        (r"\b(by status|per status|status wise)\b", "status"),
         (r"\b(by service|per service|service wise|by application|per application)\b", "service"),
-        (r"\b(function|business function|by function)\b", "business_function_derived"),
-        (r"\b(cluster|tower|workstream)\b", "cluster"),
+        (r"\b(by function|per function|business function|function wise)\b", "business_function_derived"),
+        (r"\b(by cluster|per cluster|cluster wise|by tower|tower wise|workstream wise)\b", "cluster"),
     ]
+
     for pattern, column in explicit_patterns:
         if re.search(pattern, q) and column in df.columns:
             return column
 
-    if any(k in q for k in ["over time", "trend", "timeline", "time series", "last", "past"]):
+    if any(k in q for k in ["over time", "trend", "timeline", "time series", "daywise", "weekwise", "monthwise"]):
+        if "created_at" in df.columns:
+            return "created_at"
+
+    if lookback_phrase:
         if "created_at" in df.columns:
             return "created_at"
 
@@ -259,8 +269,32 @@ def _extract_filters(query: str, df: pd.DataFrame) -> dict[str, list[str]]:
             continue
         captured = match.group(1).strip().replace(" tickets only", "").replace(" only", "")
         captured = re.sub(r"\s+", " ", captured)
-        if captured:
-            filters[column] = [captured]
+        if not captured:
+            continue
+
+        parsed_values: list[str]
+        if column == "priority":
+            inferred: set[str] = {f"P{x}" for x in re.findall(r"\bp\s*([1-4])\b", captured, flags=re.IGNORECASE)}
+            lowered = f" {captured.lower()} "
+            descriptor_map = {
+                "critical": "P1",
+                "high": "P2",
+                "medium": "P3",
+                "moderate": "P3",
+                "low": "P4",
+                "minor": "P4",
+            }
+            for marker, mapped in descriptor_map.items():
+                if f" {marker} " in lowered:
+                    inferred.add(mapped)
+            parsed_values = sorted(inferred) if inferred else [captured]
+        else:
+            parsed_values = [part.strip() for part in re.split(r"\s*(?:,|/|&| and )\s*", captured) if part.strip()]
+            if not parsed_values:
+                parsed_values = [captured]
+
+        merged = filters.get(column, []) + parsed_values
+        filters[column] = sorted({value for value in merged}, key=lambda value: value.lower())
 
     candidate_columns = [
         "team",
@@ -285,7 +319,8 @@ def _extract_filters(query: str, df: pd.DataFrame) -> dict[str, list[str]]:
             if f" {token} " in qnorm:
                 matches.append(value)
         if matches:
-            filters[column] = sorted(set(matches))
+            merged = filters.get(column, []) + matches
+            filters[column] = sorted({value for value in merged}, key=lambda value: value.lower())
 
     return filters
 
@@ -334,13 +369,13 @@ def _has_explicit_chart_type(query: str) -> bool:
 def _has_explicit_dimension_phrase(query: str) -> bool:
     q = query.lower()
     patterns = [
-        r"\b(team|by team|per team|assignment groups?|groupwise)\b",
-        r"\b(category|by category|issue category|recurring category)\b",
-        r"\b(priority|by priority|per priority|priority wise)\b",
-        r"\b(status|by status)\b",
+        r"\b(by team|per team|team wise|assignment groups?|groupwise|by assignment group|per assignment group)\b",
+        r"\b(by category|per category|issue category|recurring category|category wise)\b",
+        r"\b(by priority|per priority|priority wise|priority trend|priority breakdown)\b",
+        r"\b(by status|per status|status wise)\b",
         r"\b(by service|per service|service wise|by application|per application)\b",
-        r"\b(function|business function|by function)\b",
-        r"\b(cluster|tower|workstream)\b",
+        r"\b(by function|per function|business function|function wise)\b",
+        r"\b(by cluster|per cluster|cluster wise|by tower|tower wise|workstream wise)\b",
     ]
     return any(re.search(pattern, q) is not None for pattern in patterns)
 

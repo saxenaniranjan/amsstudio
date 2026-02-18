@@ -88,6 +88,25 @@ def test_agentic_mttr_last_month_priority_filters_generate_line_time_graph(raw_t
     assert intent.get("lookback_unit") == "month"
 
 
+def test_mttr_priority_query_with_priority_text_variants_uses_time_dimension(raw_ticket_df, reference_time) -> None:
+    with_priority_labels = raw_ticket_df.copy()
+    with_priority_labels["Severity"] = ["P1 - Critical", "P2 - High", "P3 - Medium", "P2 - High", "P4 - Low", "P3 - Medium"]
+    enriched = run_ticket_pipeline(with_priority_labels, reference_time=reference_time)
+
+    result = answer_query("Create a line graph for mttr over last month for Priority P2 and P3", enriched)
+
+    assert result.kind == "chart"
+    assert result.chart is not None
+    assert result.data is not None
+    assert not result.data.empty
+
+    trace = result.agent_trace or {}
+    intent = trace.get("intent", {})
+    assert intent.get("dimension") == "created_at"
+    assert intent.get("filters", {}).get("priority") == ["P2", "P3"]
+    assert set(result.data["priority"].astype(str).unique()) == {"P2", "P3"}
+
+
 def test_llm_plan_is_refined_with_rule_fallbacks(raw_ticket_df, reference_time) -> None:
     enriched = run_ticket_pipeline(raw_ticket_df, reference_time=reference_time)
     planner = IntentAgent(enriched)

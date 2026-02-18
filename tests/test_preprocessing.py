@@ -66,6 +66,41 @@ def test_preprocess_extended_aliases_and_duration_parsing() -> None:
     assert bool(row["is_resolved"]) is True
 
 
+def test_preprocess_standardizes_priority_variants() -> None:
+    raw = pd.DataFrame(
+        {
+            "Incident Number": ["INC900", "INC901", "INC902", "INC903", "INC904"],
+            "Short Description": [
+                "Issue A",
+                "Issue B",
+                "Issue C",
+                "Issue D",
+                "Issue E",
+            ],
+            "Assignment Group": ["Team A", "Team B", "Team C", "Team D", "Team E"],
+            "State": ["Closed", "Closed", "Closed", "Open", "Open"],
+            "Priority": ["P2 - High", "Priority 3", "sev1", "LOW", None],
+            "Open Date": [
+                "2026-02-01 09:00:00",
+                "2026-02-01 09:10:00",
+                "2026-02-01 09:20:00",
+                "2026-02-01 09:30:00",
+                "2026-02-01 09:40:00",
+            ],
+            "Resolved On": [
+                "2026-02-01 10:00:00",
+                "2026-02-01 10:00:00",
+                "2026-02-01 10:00:00",
+                None,
+                None,
+            ],
+        }
+    )
+
+    output = preprocess_tickets(raw)
+    assert output["priority"].tolist() == ["P2", "P3", "P1", "P4", "Unknown"]
+
+
 def test_preprocess_includes_extended_optional_fields() -> None:
     raw = pd.DataFrame(
         {

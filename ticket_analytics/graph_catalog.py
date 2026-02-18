@@ -10,7 +10,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.graph_objs import Figure
 
-from .constants import PRD_GRAPH_IDS
+from .constants import PRD_GRAPH_IDS, RESOLVED_STATUSES
 from .prd_metrics import determine_dynamic_grain
 
 
@@ -43,8 +43,19 @@ def _resample_count(frame: pd.DataFrame, datetime_col: str, freq: str, value_nam
 
 
 def _graph_1_ticket_trend(df: pd.DataFrame, freq: str) -> GraphOutput:
+    resolved_mask = pd.Series(False, index=df.index)
+    if "is_resolved" in df.columns:
+        raw_mask = df["is_resolved"]
+        if pd.api.types.is_bool_dtype(raw_mask):
+            resolved_mask = raw_mask.fillna(False)
+        else:
+            text_mask = raw_mask.astype(str).str.strip().str.lower()
+            resolved_mask = text_mask.isin({"true", "1", "yes", "y"}) | text_mask.isin(RESOLVED_STATUSES)
+    if "resolved_at" in df.columns:
+        resolved_mask = resolved_mask | df["resolved_at"].notna()
+
     inflow = _resample_count(df, "created_at", freq, "inflow")
-    outflow = _resample_count(df[df["is_resolved"]], "resolved_at", freq, "outflow")
+    outflow = _resample_count(df[resolved_mask.fillna(False)], "resolved_at", freq, "outflow")
 
     merged = pd.merge(inflow, outflow, on="period", how="outer").fillna(0).sort_values("period")
     merged["backlog"] = (merged["inflow"] - merged["outflow"]).cumsum()
@@ -229,9 +240,27 @@ def _graph_7_top_aged_open_tickets(df: pd.DataFrame) -> GraphOutput:
 def _graph_8_time_trend_heatmap(df: pd.DataFrame) -> GraphOutput:
     frame = df.dropna(subset=["created_at"]).copy()
     if frame.empty:
-        empty = pd.DataFrame(columns=["weekday", "hour", "ticket_count"])
-        fig = px.density_heatmap(empty, x="weekday", y="hour", z="ticket_count", title="Graph 8: Time Trend Analysis")
+        empty = pd.DataFrame(columns=["weekday", "hour", "hour_label", "ticket_count"])
+        fig = go.Figure(
+            data=[
+                go.Heatmap(
+                    x=[f"{hour:02d}:00" for hour in range(24)],
+                    y=["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+                    z=np.zeros((7, 24)),
+                    colorscale="YlOrRd",
+                    colorbar={"title": "Tickets"},
+                )
+            ]
+        )
+        fig.update_layout(
+            title="Graph 8: Time Trend Analysis",
+            xaxis_title="Hour of Day",
+            yaxis_title="Day of Week",
+        )
         return GraphOutput("graph_8", "Time Trend Analysis", fig, empty, "No dated records available.")
+
+    weekday_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    hour_order = list(range(24))
 
     frame["weekday"] = frame["created_at"].dt.day_name().str[:3]
     frame["hour"] = frame["created_at"].dt.hour
@@ -243,17 +272,26 @@ def _graph_8_time_trend_heatmap(df: pd.DataFrame) -> GraphOutput:
         .reset_index()
     )
 
-    weekday_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    full_grid = pd.MultiIndex.from_product([weekday_order, hour_order], names=["weekday", "hour"]).to_frame(index=False)
+    grouped = full_grid.merge(grouped, on=["weekday", "hour"], how="left")
+    grouped["ticket_count"] = grouped["ticket_count"].fillna(0).astype(int)
     grouped["weekday"] = pd.Categorical(grouped["weekday"], categories=weekday_order, ordered=True)
+    grouped["hour_label"] = grouped["hour"].map(lambda hour: f"{int(hour):02d}:00")
 
-    fig = px.density_heatmap(
-        grouped,
-        x="weekday",
-        y="hour",
-        z="ticket_count",
-        color_continuous_scale="YlOrRd",
-        title="Graph 8: Time Trend Analysis",
+    pivot = grouped.pivot(index="weekday", columns="hour_label", values="ticket_count").reindex(weekday_order)
+    fig = go.Figure(
+        data=[
+            go.Heatmap(
+                x=list(pivot.columns),
+                y=list(pivot.index),
+                z=pivot.to_numpy(),
+                colorscale="YlOrRd",
+                colorbar={"title": "Tickets"},
+            )
+        ]
     )
+    fig.update_layout(title="Graph 8: Time Trend Analysis", xaxis_title="Hour of Day", yaxis_title="Day of Week")
+    fig.update_yaxes(categoryorder="array", categoryarray=weekday_order)
 
     return GraphOutput(
         graph_id="graph_8",

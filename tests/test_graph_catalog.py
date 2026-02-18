@@ -21,3 +21,28 @@ def test_word_cloud_and_composite(raw_ticket_df, reference_time) -> None:
 
     composite = build_composite_graph(enriched, x_col="team", y_col="mttr_hours", chart_type="bar")
     assert composite is not None
+
+
+def test_graph_1_handles_nullable_is_resolved(raw_ticket_df, reference_time) -> None:
+    enriched = run_ticket_pipeline(raw_ticket_df, reference_time=reference_time)
+    nullable = enriched.copy()
+    nullable["is_resolved"] = nullable["is_resolved"].astype(object)
+    nullable.loc[nullable.index[0], "is_resolved"] = None
+
+    output = build_prd_graph(nullable, "graph_1")
+    assert output.figure is not None
+    assert {"period", "inflow", "outflow", "backlog"}.issubset(set(output.data.columns))
+
+
+def test_graph_8_is_hour_of_day_over_week_heatmap(raw_ticket_df, reference_time) -> None:
+    enriched = run_ticket_pipeline(raw_ticket_df, reference_time=reference_time)
+    output = build_prd_graph(enriched, "graph_8")
+
+    assert output.figure is not None
+    assert len(output.figure.data) == 1
+    trace = output.figure.data[0]
+    assert list(trace.y) == ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    assert len(trace.x) == 24
+    assert trace.x[0] == "00:00"
+    assert trace.x[-1] == "23:00"
+    assert int(output.data["ticket_count"].sum()) == int(enriched["created_at"].notna().sum())

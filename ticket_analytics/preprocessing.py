@@ -212,8 +212,37 @@ def parse_duration_to_hours(value: object) -> float:
 def _standardize_priority(value: object) -> str:
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return "Unknown"
-    key = normalize_column_name(str(value))
-    return PRIORITY_MAP.get(key, str(value).strip().upper() if str(value).strip() else "Unknown")
+    raw = str(value).strip()
+    if not raw:
+        return "Unknown"
+
+    key = normalize_column_name(raw)
+    direct = PRIORITY_MAP.get(key)
+    if direct:
+        return direct
+
+    normalized = f" {raw.lower()} "
+    token_match = re.search(r"\bp\s*([1-4])\b", normalized)
+    if token_match:
+        return f"P{token_match.group(1)}"
+
+    sev_match = re.search(r"\b(?:sev(?:erity)?|priority)\s*[-_: ]*([1-4])\b", normalized)
+    if sev_match:
+        return f"P{sev_match.group(1)}"
+
+    descriptor_map = {
+        "critical": "P1",
+        "high": "P2",
+        "medium": "P3",
+        "moderate": "P3",
+        "low": "P4",
+        "minor": "P4",
+    }
+    for marker, mapped in descriptor_map.items():
+        if f" {marker} " in normalized:
+            return mapped
+
+    return raw.upper()
 
 
 def _ensure_columns(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:

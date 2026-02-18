@@ -10,3 +10,6 @@ venv/
 .env
 .DS_Store
 .streamlit/
+
+build/
+*.egg-info/

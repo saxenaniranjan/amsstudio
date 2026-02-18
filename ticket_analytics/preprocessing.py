@@ -93,6 +93,21 @@ def _canonical_alias_map() -> dict[str, str]:
     return mapping
 
 
+def _normalize_blank_series(series: pd.Series) -> pd.Series:
+    cleaned = series.copy()
+    if pd.api.types.is_object_dtype(cleaned) or pd.api.types.is_string_dtype(cleaned):
+        as_text = cleaned.astype(str).str.strip()
+        blank_mask = cleaned.isna() | as_text.eq("") | as_text.str.lower().isin({"nan", "none", "nat", "null"})
+        cleaned = cleaned.mask(blank_mask, np.nan)
+    return cleaned
+
+
+def _coalesce_columns(left: pd.Series, right: pd.Series) -> pd.Series:
+    left_norm = _normalize_blank_series(left)
+    right_norm = _normalize_blank_series(right)
+    return left_norm.combine_first(right_norm)
+
+
 def normalize_and_alias_columns(df: pd.DataFrame, user_mapping: dict[str, str] | None = None) -> pd.DataFrame:
     result = df.copy()
     original_normalized = [normalize_column_name(col) for col in result.columns]
@@ -114,22 +129,33 @@ def normalize_and_alias_columns(df: pd.DataFrame, user_mapping: dict[str, str] |
             result = result.rename(columns=rename_by_user)
 
     alias_to_canonical = _canonical_alias_map()
-    renamed: dict[str, str] = {}
-    existing = set(result.columns)
+    canonical_groups: dict[str, list[str]] = {}
     for col in result.columns:
         canonical = alias_to_canonical.get(col)
         if canonical is None:
             canonical = _guess_canonical_column(col)
         if canonical is None:
             continue
-        if canonical == col:
-            continue
-        if canonical in existing or canonical in renamed.values():
-            continue
-        renamed[col] = canonical
+        canonical_groups.setdefault(canonical, []).append(col)
 
-    if renamed:
-        result = result.rename(columns=renamed)
+    for canonical, source_cols in canonical_groups.items():
+        ordered_sources = list(dict.fromkeys(source_cols))
+        if canonical in result.columns:
+            primary = canonical
+        else:
+            primary = ordered_sources[0]
+
+        combined = _normalize_blank_series(result[primary])
+        for source_col in ordered_sources:
+            if source_col == primary:
+                continue
+            combined = _coalesce_columns(combined, result[source_col])
+
+        result[canonical] = combined
+
+        for source_col in ordered_sources:
+            if source_col != canonical and source_col in result.columns:
+                result = result.drop(columns=[source_col])
 
     return result
 

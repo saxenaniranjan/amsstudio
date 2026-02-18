@@ -135,3 +135,22 @@ def test_preprocess_includes_extended_optional_fields() -> None:
     assert row["company"] == "Coforge"
     assert row["department"] == "IT"
     assert row["requester_job_title"] == "Analyst"
+
+
+def test_preprocess_prefers_application_alias_when_service_column_is_blank() -> None:
+    raw = pd.DataFrame(
+        {
+            "Incident Number": ["INC3001", "INC3002"],
+            "Short Description": ["App issue", "DB issue"],
+            "Assignment Group": ["App Team", "DBA Team"],
+            "State": ["Closed", "Closed"],
+            "Priority": ["P2", "P3"],
+            "Service": ["", None],
+            "Application Name": ["Salesforce", "Oracle ERP"],
+            "Open Date": ["2026-02-01 09:00:00", "2026-02-01 10:00:00"],
+            "Resolved Date": ["2026-02-01 12:00:00", "2026-02-01 15:00:00"],
+        }
+    )
+
+    output = preprocess_tickets(raw)
+    assert output["service"].tolist() == ["Salesforce", "Oracle ERP"]

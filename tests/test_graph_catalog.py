@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pandas as pd
+
 from ticket_analytics.graph_catalog import build_composite_graph, build_prd_graph, build_word_cloud_plotly
 from ticket_analytics.pipeline import run_ticket_pipeline
 
@@ -46,3 +48,14 @@ def test_graph_8_is_hour_of_day_over_week_heatmap(raw_ticket_df, reference_time)
     assert trace.x[0] == "00:00"
     assert trace.x[-1] == "23:00"
     assert int(output.data["ticket_count"].sum()) == int(enriched["created_at"].notna().sum())
+
+
+def test_graph_1_falls_back_to_updated_or_resolved_when_created_missing(raw_ticket_df, reference_time) -> None:
+    enriched = run_ticket_pipeline(raw_ticket_df, reference_time=reference_time)
+    fallback_df = enriched.copy()
+    fallback_df["created_at"] = pd.NaT
+    fallback_df["updated_at"] = fallback_df["resolved_at"]
+
+    output = build_prd_graph(fallback_df, "graph_1")
+    assert output.figure is not None
+    assert not output.data.empty

@@ -19,3 +19,19 @@ def test_suggest_global_filters(raw_ticket_df, reference_time) -> None:
     filters = suggest_global_filters(enriched)
 
     assert "priority" in filters or "team" in filters
+
+
+def test_mapping_candidates_include_application_alias() -> None:
+    import pandas as pd
+
+    raw = pd.DataFrame(
+        {
+            "Incident Number": ["INC1"],
+            "Assignment Group": ["Service Desk"],
+            "Application Name": ["Salesforce"],
+        }
+    )
+
+    suggestions = suggest_mapping_candidates(raw)
+    assert "service" in suggestions
+    assert "Application Name" in suggestions["service"]

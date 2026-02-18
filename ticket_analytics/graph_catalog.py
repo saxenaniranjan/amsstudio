@@ -43,6 +43,20 @@ def _resample_count(frame: pd.DataFrame, datetime_col: str, freq: str, value_nam
 
 
 def _graph_1_ticket_trend(df: pd.DataFrame, freq: str) -> GraphOutput:
+    inflow_datetime_col = "created_at"
+    if inflow_datetime_col not in df or df[inflow_datetime_col].isna().all():
+        for candidate in ["updated_at", "resolved_at"]:
+            if candidate in df and df[candidate].notna().any():
+                inflow_datetime_col = candidate
+                break
+
+    outflow_datetime_col = "resolved_at"
+    if outflow_datetime_col not in df or df[outflow_datetime_col].isna().all():
+        if "updated_at" in df and df["updated_at"].notna().any():
+            outflow_datetime_col = "updated_at"
+        else:
+            outflow_datetime_col = inflow_datetime_col
+
     resolved_mask = pd.Series(False, index=df.index)
     if "is_resolved" in df.columns:
         raw_mask = df["is_resolved"]
@@ -54,8 +68,8 @@ def _graph_1_ticket_trend(df: pd.DataFrame, freq: str) -> GraphOutput:
     if "resolved_at" in df.columns:
         resolved_mask = resolved_mask | df["resolved_at"].notna()
 
-    inflow = _resample_count(df, "created_at", freq, "inflow")
-    outflow = _resample_count(df[resolved_mask.fillna(False)], "resolved_at", freq, "outflow")
+    inflow = _resample_count(df, inflow_datetime_col, freq, "inflow")
+    outflow = _resample_count(df[resolved_mask.fillna(False)], outflow_datetime_col, freq, "outflow")
 
     merged = pd.merge(inflow, outflow, on="period", how="outer").fillna(0).sort_values("period")
     merged["backlog"] = (merged["inflow"] - merged["outflow"]).cumsum()

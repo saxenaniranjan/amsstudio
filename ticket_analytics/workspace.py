@@ -27,6 +27,9 @@ def suggest_mapping_candidates(df: pd.DataFrame) -> dict[str, list[str]]:
     for canonical in PRD_MANDATORY_FIELDS:
         expected_tokens = set(canonical.split("_"))
         alias_set = {normalize_column_name(alias) for alias in COLUMN_ALIASES.get(canonical, [])}
+        alias_tokens = set()
+        for alias in alias_set:
+            alias_tokens.update(alias.split("_"))
         scored: list[tuple[int, str]] = []
         for col in normalized_cols:
             tokens = set(col.split("_"))
@@ -34,6 +37,9 @@ def suggest_mapping_candidates(df: pd.DataFrame) -> dict[str, list[str]]:
             if col in alias_set:
                 score += 100
             score += 10 * len(expected_tokens & tokens)
+            score += 6 * len(alias_tokens & tokens)
+            if any(alias in col or col in alias for alias in alias_set):
+                score += 12
             if canonical in col:
                 score += 25
             scored.append((score, col))
